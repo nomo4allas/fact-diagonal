@@ -1,0 +1,9 @@
+# Credenciales
+config.env
+*.env
+
+# Logs
+/logs
+
+# Binario
+*.exe
