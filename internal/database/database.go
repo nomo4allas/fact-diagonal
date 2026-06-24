@@ -4,7 +4,12 @@
 // Man_RadicadoFacturas_Test usando el campo llave [Cufe/Cude] (cuyo nombre
 // lleva una barra diagonal y por eso SIEMPRE se escribe entre corchetes). Si lo
 // encuentra, actualiza los campos de recepción e inserta el PDF y el XML en la
-// tabla dbo.Adjuntos.
+// tabla dbo.Adjuntos, todo dentro de una misma transacción.
+//
+// Como el radicado vive en una base (DMSDiagonal) y los adjuntos en otra
+// (Adjuntos), se usa una ÚNICA conexión y nombres calificados de tres partes
+// ([base].dbo.tabla). SQL Server resuelve la transacción cross-database dentro
+// de la misma instancia sin necesidad de MSDTC.
 //
 // Reglas de seguridad:
 //   - NUNCA hace INSERT en Man_RadicadoFacturas_Test; solo UPDATE de registros
@@ -32,24 +37,25 @@ type Logger interface {
 
 // Config agrupa los parámetros de conexión a SQL Server.
 type Config struct {
-	Server    string
-	Port      string
-	User      string
-	Password  string
-	NameDMS   string // base con Man_RadicadoFacturas_Test
-	NameAdj   string // base con la tabla Adjuntos
+	Server   string
+	Port     string
+	User     string
+	Password string
+	NameDMS  string // base con Man_RadicadoFacturas_Test
+	NameAdj  string // base con la tabla Adjuntos
 }
 
-// Client mantiene las conexiones a las dos bases (DMS y Adjuntos) y la política
-// de simulación.
+// Client mantiene la conexión a SQL Server y la política de simulación. Usa una
+// sola conexión para poder ejecutar transacciones que abarcan ambas bases.
 type Client struct {
-	dms        *sql.DB
-	adj        *sql.DB
+	db         *sql.DB
+	nameDMS    string
+	nameAdj    string
 	log        Logger
 	simulation bool
 }
 
-// dsn arma la cadena de conexión para una base concreta. Usa encrypt=disable y
+// dsn arma la cadena de conexión. Usa encrypt=disable y
 // TrustServerCertificate=true, apropiado para el SQL Server local en Docker.
 func (c Config) dsn(database string) string {
 	port := c.Port
@@ -71,60 +77,29 @@ func (c Config) dsn(database string) string {
 	return u.String()
 }
 
-// Open abre las conexiones a ambas bases y verifica la conectividad.
+// Open abre la conexión (a la base DMS, desde la que se referencian ambas bases
+// por nombre calificado) y verifica la conectividad.
 func Open(ctx context.Context, cfg Config, log Logger, simulation bool) (*Client, error) {
-	dms, err := openDB(cfg.dsn(cfg.NameDMS))
+	db, err := sql.Open("sqlserver", cfg.dsn(cfg.NameDMS))
 	if err != nil {
-		return nil, fmt.Errorf("no se pudo preparar la conexión a %s: %w", cfg.NameDMS, err)
-	}
-	adj, err := openDB(cfg.dsn(cfg.NameAdj))
-	if err != nil {
-		dms.Close()
-		return nil, fmt.Errorf("no se pudo preparar la conexión a %s: %w", cfg.NameAdj, err)
-	}
-
-	c := &Client{dms: dms, adj: adj, log: log, simulation: simulation}
-	if err := c.ping(ctx); err != nil {
-		c.Close()
-		return nil, err
-	}
-	return c, nil
-}
-
-func openDB(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlserver", dsn)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("no se pudo preparar la conexión: %w", err)
 	}
 	db.SetConnMaxLifetime(5 * time.Minute)
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
-	return db, nil
+
+	c := &Client{db: db, nameDMS: cfg.NameDMS, nameAdj: cfg.NameAdj, log: log, simulation: simulation}
+	if err := c.db.PingContext(ctx); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("no responde SQL Server: %w", err)
+	}
+	return c, nil
 }
 
-// ping comprueba que ambas bases respondan.
-func (c *Client) ping(ctx context.Context) error {
-	if err := c.dms.PingContext(ctx); err != nil {
-		return fmt.Errorf("no responde la base DMS: %w", err)
-	}
-	if err := c.adj.PingContext(ctx); err != nil {
-		return fmt.Errorf("no responde la base Adjuntos: %w", err)
+// Close cierra la conexión.
+func (c *Client) Close() error {
+	if c.db != nil {
+		return c.db.Close()
 	}
 	return nil
-}
-
-// Close cierra ambas conexiones.
-func (c *Client) Close() error {
-	var firstErr error
-	if c.dms != nil {
-		if err := c.dms.Close(); err != nil {
-			firstErr = err
-		}
-	}
-	if c.adj != nil {
-		if err := c.adj.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }
