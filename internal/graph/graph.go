@@ -4,6 +4,7 @@ package graph
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,9 +73,21 @@ type messagesResponse struct {
 // Es una operación estrictamente de lectura: no marca como leído ni mueve
 // ningún mensaje.
 func (c *Client) ListUnreadMessages(ctx context.Context, mailbox string) ([]Message, error) {
+	return c.listMessages(ctx, mailbox, "isRead eq false")
+}
+
+// ListUnreadWithAttachments devuelve los correos NO leídos que además tienen
+// adjuntos. Es el punto de entrada del Módulo 2 (extracción de datos).
+func (c *Client) ListUnreadWithAttachments(ctx context.Context, mailbox string) ([]Message, error) {
+	return c.listMessages(ctx, mailbox, "isRead eq false and hasAttachments eq true")
+}
+
+// listMessages lista los mensajes de la bandeja de entrada aplicando el
+// filtro OData indicado, siguiendo la paginación de Graph (solo lectura).
+func (c *Client) listMessages(ctx context.Context, mailbox, filter string) ([]Message, error) {
 	// Construimos la primera URL con el filtro y los campos seleccionados.
 	q := url.Values{}
-	q.Set("$filter", "isRead eq false")
+	q.Set("$filter", filter)
 	q.Set("$select", "id,subject,from,receivedDateTime,hasAttachments,isRead")
 	q.Set("$orderby", "receivedDateTime DESC")
 	q.Set("$top", "50")
@@ -122,4 +135,69 @@ func (c *Client) fetchPage(ctx context.Context, rawURL string) (*messagesRespons
 		return nil, fmt.Errorf("error decodificando la respuesta de Graph: %w", err)
 	}
 	return &out, nil
+}
+
+// Attachment representa un adjunto de tipo fileAttachment tal como lo entrega
+// Graph, con su contenido embebido en base64 (contentBytes).
+type Attachment struct {
+	ODataType    string `json:"@odata.type"`
+	Name         string `json:"name"`
+	ContentType  string `json:"contentType"`
+	Size         int    `json:"size"`
+	IsInline     bool   `json:"isInline"`
+	ContentBytes string `json:"contentBytes"`
+}
+
+// Bytes decodifica el contenido del adjunto desde su representación base64.
+func (a Attachment) Bytes() ([]byte, error) {
+	if a.ContentBytes == "" {
+		return nil, fmt.Errorf("el adjunto %q no trae contentBytes", a.Name)
+	}
+	data, err := base64.StdEncoding.DecodeString(a.ContentBytes)
+	if err != nil {
+		return nil, fmt.Errorf("error decodificando base64 del adjunto %q: %w", a.Name, err)
+	}
+	return data, nil
+}
+
+// attachmentsResponse modela la colección de adjuntos de un mensaje.
+type attachmentsResponse struct {
+	Value []Attachment `json:"value"`
+}
+
+// ListAttachments descarga los adjuntos (fileAttachment) de un mensaje,
+// incluyendo su contenido en base64. Solo lectura: no modifica el correo.
+//
+// Graph entrega contentBytes inline hasta cierto tamaño; los adjuntos sin
+// contentBytes (p.ej. itemAttachment o referencias) se devuelven igualmente
+// para que el llamador decida, pero su .Bytes() fallará.
+func (c *Client) ListAttachments(ctx context.Context, mailbox, messageID string) ([]Attachment, error) {
+	rawURL := fmt.Sprintf("%s/users/%s/messages/%s/attachments",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(messageID))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error construyendo la petición de adjuntos: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error llamando a Graph (adjuntos): %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error leyendo la respuesta de adjuntos: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Graph respondió %d al pedir adjuntos: %s", resp.StatusCode, string(body))
+	}
+
+	var out attachmentsResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("error decodificando los adjuntos de Graph: %w", err)
+	}
+	return out.Value, nil
 }

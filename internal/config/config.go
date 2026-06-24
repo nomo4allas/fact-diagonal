@@ -17,6 +17,7 @@ type Config struct {
 	ClientSecret   string // Secreto del cliente
 	Mailbox        string // Buzón a leer, p.ej. facturae@diagonal.com.co
 	SimulationMode bool   // Si true, el agente solo lee y nunca modifica nada
+	GeminiAPIKey   string // Clave de Gemini API (opcional, último eslabón de la cascada)
 }
 
 // Load lee el archivo indicado (por defecto "config.env"), valida los
@@ -38,6 +39,7 @@ func Load(path string) (*Config, error) {
 		ClientSecret:   strings.TrimSpace(os.Getenv("CLIENT_SECRET")),
 		Mailbox:        strings.TrimSpace(os.Getenv("MAILBOX")),
 		SimulationMode: parseBool(os.Getenv("SIMULATION_MODE"), true),
+		GeminiAPIKey:   strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
 	}
 
 	if err := cfg.validate(); err != nil {
