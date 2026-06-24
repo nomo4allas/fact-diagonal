@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/nomo4allas/fact-diagonal/internal/auth"
@@ -46,7 +47,7 @@ func main() {
 
 	// Contexto con timeout global. El Módulo 2 descarga adjuntos y puede
 	// invocar OCR/Gemini, por lo que damos un margen amplio.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
 	// 2) Autenticación OAuth2 Client Credentials.
@@ -104,6 +105,20 @@ func main() {
 		}
 	}
 	lg.Infof("Correos no leídos con adjuntos: %d", len(withAtt))
+
+	// Filtro opcional por remitente (FILTER_FROM): útil para procesar un
+	// correo concreto en pruebas controladas.
+	if cfg.FilterFrom != "" {
+		needle := strings.ToLower(cfg.FilterFrom)
+		var filtered []graph.Message
+		for _, m := range withAtt {
+			if strings.Contains(strings.ToLower(m.SenderName()), needle) {
+				filtered = append(filtered, m)
+			}
+		}
+		lg.Infof("Filtro FILTER_FROM=%q activo: %d correo(s) coinciden.", cfg.FilterFrom, len(filtered))
+		withAtt = filtered
+	}
 
 	// Límite de seguridad: procesar como máximo este número de correos por
 	// corrida (útil para pruebas controladas en modo simulación).

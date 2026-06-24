@@ -25,6 +25,11 @@ import (
 const (
 	defaultModel = "gemini-2.5-flash"
 	endpointFmt  = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+
+	// La API devuelve 503/429 transitorios bajo alta demanda; reintentamos con
+	// backoff exponencial antes de rendirnos.
+	maxAttempts = 4
+	baseBackoff = 1500 * time.Millisecond
 )
 
 // prompt pide a Gemini un JSON estricto con los campos de interés.
@@ -123,26 +128,9 @@ func (c *Client) Extract(ctx context.Context, pdf []byte) (invoice.Data, error) 
 		return invoice.Data{}, fmt.Errorf("error serializando la petición a Gemini: %w", err)
 	}
 
-	url := fmt.Sprintf(endpointFmt, c.model)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	body, err := c.doWithRetry(ctx, payload)
 	if err != nil {
-		return invoice.Data{}, fmt.Errorf("error construyendo la petición a Gemini: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", c.apiKey)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return invoice.Data{}, fmt.Errorf("error llamando a Gemini: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return invoice.Data{}, fmt.Errorf("error leyendo la respuesta de Gemini: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return invoice.Data{}, fmt.Errorf("Gemini respondió %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return invoice.Data{}, err
 	}
 
 	var gr genResponse
@@ -175,6 +163,66 @@ func (c *Client) Extract(ctx context.Context, pdf []byte) (invoice.Data, error) 
 	}
 	d.DerivePrefijo()
 	return d, nil
+}
+
+// doWithRetry envía la petición y reintenta ante errores transitorios
+// (503/429/500) con backoff exponencial. Devuelve el cuerpo de la respuesta
+// 200 OK o el último error.
+func (c *Client) doWithRetry(ctx context.Context, payload []byte) ([]byte, error) {
+	url := fmt.Sprintf(endpointFmt, c.model)
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("error construyendo la petición a Gemini: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", c.apiKey)
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("error llamando a Gemini: %w", err)
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			switch {
+			case readErr != nil:
+				lastErr = fmt.Errorf("error leyendo la respuesta de Gemini: %w", readErr)
+			case resp.StatusCode == http.StatusOK:
+				return body, nil
+			case isTransient(resp.StatusCode):
+				lastErr = fmt.Errorf("Gemini respondió %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			default:
+				// Error no recuperable (p.ej. 400/401/403): no reintentamos.
+				return nil, fmt.Errorf("Gemini respondió %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			}
+		}
+
+		if attempt < maxAttempts {
+			// Backoff exponencial: 1.5s, 3s, 6s…
+			wait := baseBackoff * time.Duration(1<<(attempt-1))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+	}
+	return nil, fmt.Errorf("Gemini sin éxito tras %d intentos: %w", maxAttempts, lastErr)
+}
+
+// isTransient indica si conviene reintentar para el código de estado dado.
+func isTransient(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout:      // 504
+		return true
+	}
+	return false
 }
 
 func firstText(gr genResponse) string {
