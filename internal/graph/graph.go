@@ -73,21 +73,9 @@ type messagesResponse struct {
 // Es una operación estrictamente de lectura: no marca como leído ni mueve
 // ningún mensaje.
 func (c *Client) ListUnreadMessages(ctx context.Context, mailbox string) ([]Message, error) {
-	return c.listMessages(ctx, mailbox, "isRead eq false")
-}
-
-// ListUnreadWithAttachments devuelve los correos NO leídos que además tienen
-// adjuntos. Es el punto de entrada del Módulo 2 (extracción de datos).
-func (c *Client) ListUnreadWithAttachments(ctx context.Context, mailbox string) ([]Message, error) {
-	return c.listMessages(ctx, mailbox, "isRead eq false and hasAttachments eq true")
-}
-
-// listMessages lista los mensajes de la bandeja de entrada aplicando el
-// filtro OData indicado, siguiendo la paginación de Graph (solo lectura).
-func (c *Client) listMessages(ctx context.Context, mailbox, filter string) ([]Message, error) {
 	// Construimos la primera URL con el filtro y los campos seleccionados.
 	q := url.Values{}
-	q.Set("$filter", filter)
+	q.Set("$filter", "isRead eq false")
 	q.Set("$select", "id,subject,from,receivedDateTime,hasAttachments,isRead")
 	q.Set("$orderby", "receivedDateTime DESC")
 	q.Set("$top", "50")

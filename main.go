@@ -94,12 +94,24 @@ func main() {
 	// ===================== Módulo 2 =====================
 	lg.Infof("=== Módulo 2 · extracción de datos de adjuntos ===")
 
-	withAtt, err := gc.ListUnreadWithAttachments(ctx, cfg.Mailbox)
-	if err != nil {
-		lg.Errorf("no se pudieron listar los correos con adjuntos: %v", err)
-		os.Exit(1)
+	// Reutilizamos la lista de no leídos del Módulo 1 y filtramos los que
+	// traen adjuntos del lado del cliente. (Graph rechaza el filtro servidor
+	// combinado isRead+hasAttachments con "InefficientFilter".)
+	var withAtt []graph.Message
+	for _, m := range msgs {
+		if m.HasAttachments {
+			withAtt = append(withAtt, m)
+		}
 	}
 	lg.Infof("Correos no leídos con adjuntos: %d", len(withAtt))
+
+	// Límite de seguridad: procesar como máximo este número de correos por
+	// corrida (útil para pruebas controladas en modo simulación).
+	const maxCorreos = 5
+	if len(withAtt) > maxCorreos {
+		lg.Infof("Limitando a los primeros %d correos (de %d) para esta corrida.", maxCorreos, len(withAtt))
+		withAtt = withAtt[:maxCorreos]
+	}
 
 	if cfg.GeminiAPIKey == "" {
 		lg.Infof("Gemini: deshabilitado (GEMINI_API_KEY vacía); la cascada usará solo texto nativo y OCR.")
