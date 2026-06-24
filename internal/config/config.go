@@ -19,6 +19,19 @@ type Config struct {
 	SimulationMode bool   // Si true, el agente solo lee y nunca modifica nada
 	GeminiAPIKey   string // Clave de Gemini API (opcional, último eslabón de la cascada)
 	FilterFrom     string // Opcional: si no está vacío, solo procesa correos cuyo remitente lo contenga (subcadena, case-insensitive)
+
+	// Módulo 3 — SQL Server. Opcionales: si DBServer está vacío, el módulo se omite.
+	DBServer   string // host del servidor SQL Server
+	DBPort     string // puerto (p.ej. 1433)
+	DBUser     string // usuario
+	DBPassword string // contraseña
+	DBNameDMS  string // base de datos con Man_RadicadoFacturas_Test (p.ej. DMSDiagonal)
+	DBNameAdj  string // base de datos con la tabla Adjuntos
+}
+
+// DBEnabled indica si hay configuración suficiente para activar el Módulo 3.
+func (c *Config) DBEnabled() bool {
+	return c.DBServer != "" && c.DBUser != "" && c.DBNameDMS != "" && c.DBNameAdj != ""
 }
 
 // Load lee el archivo indicado (por defecto "config.env"), valida los
@@ -42,6 +55,12 @@ func Load(path string) (*Config, error) {
 		SimulationMode: parseBool(os.Getenv("SIMULATION_MODE"), true),
 		GeminiAPIKey:   strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
 		FilterFrom:     strings.TrimSpace(os.Getenv("FILTER_FROM")),
+		DBServer:       strings.TrimSpace(os.Getenv("DB_SERVER")),
+		DBPort:         strings.TrimSpace(os.Getenv("DB_PORT")),
+		DBUser:         strings.TrimSpace(os.Getenv("DB_USER")),
+		DBPassword:     os.Getenv("DB_PASSWORD"), // sin TrimSpace: la contraseña puede tener espacios significativos
+		DBNameDMS:      strings.TrimSpace(os.Getenv("DB_NAME_DMS")),
+		DBNameAdj:      strings.TrimSpace(os.Getenv("DB_NAME_ADJ")),
 	}
 
 	if err := cfg.validate(); err != nil {

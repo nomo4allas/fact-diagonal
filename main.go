@@ -8,7 +8,11 @@
 // valor total y CUFE) del XML UBL y del PDF mediante la cascada texto-nativo →
 // Tesseract → Gemini.
 //
-// Opera en MODO SIMULACIÓN: solo lectura, sin mover ni modificar nada.
+// Módulo 3: busca cada factura en SQL Server por su CUFE; si existe, actualiza
+// los campos de recepción e inserta el PDF y el XML en la tabla Adjuntos.
+//
+// Opera en MODO SIMULACIÓN: solo lectura/búsqueda, sin escribir en el buzón ni
+// en la base de datos.
 package main
 
 import (
@@ -19,6 +23,7 @@ import (
 
 	"github.com/nomo4allas/fact-diagonal/internal/auth"
 	"github.com/nomo4allas/fact-diagonal/internal/config"
+	"github.com/nomo4allas/fact-diagonal/internal/database"
 	"github.com/nomo4allas/fact-diagonal/internal/extract/gemini"
 	"github.com/nomo4allas/fact-diagonal/internal/graph"
 	"github.com/nomo4allas/fact-diagonal/internal/logger"
@@ -134,8 +139,36 @@ func main() {
 		lg.Infof("Gemini: habilitado.")
 	}
 
+	// ===================== Módulo 3 =====================
+	// Cliente de SQL Server (opcional). Si la BD no está configurada o no
+	// responde, continuamos sin Módulo 3 (la extracción del Módulo 2 sigue).
+	var db *database.Client
+	if cfg.DBEnabled() {
+		dbCfg := database.Config{
+			Server:   cfg.DBServer,
+			Port:     cfg.DBPort,
+			User:     cfg.DBUser,
+			Password: cfg.DBPassword,
+			NameDMS:  cfg.DBNameDMS,
+			NameAdj:  cfg.DBNameAdj,
+		}
+		var err error
+		db, err = database.Open(ctx, dbCfg, lg, cfg.SimulationMode)
+		if err != nil {
+			lg.Errorf("Módulo 3 deshabilitado: no se pudo conectar a SQL Server (%s): %v", cfg.DBServer, err)
+			db = nil
+		} else {
+			defer db.Close()
+			lg.Infof("SQL Server: conectado (DMS=%s, Adjuntos=%s). Escrituras %s.",
+				cfg.DBNameDMS, cfg.DBNameAdj,
+				map[bool]string{true: "SIMULADAS (no se ejecutan)", false: "REALES"}[cfg.SimulationMode])
+		}
+	} else {
+		lg.Infof("Módulo 3 deshabilitado: faltan credenciales de BD en config.env.")
+	}
+
 	gem := gemini.New(cfg.GeminiAPIKey)
-	proc := pipeline.New(gc, gem, lg, cfg.SimulationMode)
+	proc := pipeline.New(gc, gem, db, lg, cfg.SimulationMode)
 
 	procesadas := 0
 	for i, m := range withAtt {
@@ -160,5 +193,9 @@ func main() {
 
 	lg.Infof("========================================")
 	lg.Infof("Facturas procesadas: %d (de %d correos con adjuntos)", procesadas, len(withAtt))
-	lg.Infof("Proceso finalizado (modo simulación, sin cambios en el buzón).")
+	if cfg.SimulationMode {
+		lg.Infof("Proceso finalizado (modo simulación: sin cambios en el buzón ni en la base de datos).")
+	} else {
+		lg.Infof("Proceso finalizado.")
+	}
 }

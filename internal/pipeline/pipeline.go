@@ -11,8 +11,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/nomo4allas/fact-diagonal/internal/attachment"
+	"github.com/nomo4allas/fact-diagonal/internal/database"
 	"github.com/nomo4allas/fact-diagonal/internal/extract/gemini"
 	"github.com/nomo4allas/fact-diagonal/internal/extract/ocr"
 	"github.com/nomo4allas/fact-diagonal/internal/extract/pdftext"
@@ -32,16 +34,19 @@ type Processor struct {
 	graph      *graph.Client
 	ocr        *ocr.Engine
 	gemini     *gemini.Client
+	db         *database.Client // Módulo 3; nil si la BD no está configurada
 	log        Logger
 	simulation bool
 }
 
-// New construye el Processor del Módulo 2.
-func New(gc *graph.Client, gem *gemini.Client, log Logger, simulation bool) *Processor {
+// New construye el Processor de los Módulos 2 y 3. db puede ser nil para
+// desactivar la integración con SQL Server.
+func New(gc *graph.Client, gem *gemini.Client, db *database.Client, log Logger, simulation bool) *Processor {
 	return &Processor{
 		graph:      gc,
 		ocr:        ocr.New(),
 		gemini:     gem,
+		db:         db,
 		log:        log,
 		simulation: simulation,
 	}
@@ -97,13 +102,15 @@ func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg grap
 
 	var results []Result
 	for _, b := range bundles {
-		results = append(results, p.processBundle(ctx, b))
+		results = append(results, p.processBundle(ctx, b, msg.ReceivedDateTime))
 	}
 	return results, nil
 }
 
-// processBundle extrae los datos de un bundle (un PDF y/o un XML) y los logea.
-func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle) Result {
+// processBundle extrae los datos de un bundle (un PDF y/o un XML), los logea y,
+// si la BD está activa, los persiste (Módulo 3). fechaCorreo es la fecha de
+// recepción del correo, usada para FechaHoraOriginal.
+func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fechaCorreo time.Time) Result {
 	res := Result{Origin: b.Origin}
 
 	// 1) XML UBL: fuente autoritativa.
@@ -131,6 +138,20 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle) Resu
 
 	p.logDiscrepancies(res)
 	p.logFinal(res.Final)
+
+	// 4) Módulo 3: persistir en SQL Server (si está configurado).
+	if p.db != nil {
+		var adjuntos []database.Adjunto
+		if b.HasPDF() {
+			adjuntos = append(adjuntos, database.Adjunto{Nombre: b.PDFName, Extension: "pdf", Contenido: b.PDF})
+		}
+		if b.HasXML() {
+			adjuntos = append(adjuntos, database.Adjunto{Nombre: b.XMLName, Extension: "xml", Contenido: b.XML})
+		}
+		if err := p.db.PersistInvoice(ctx, res.Final, fechaCorreo, adjuntos); err != nil {
+			p.log.Errorf("    · BD: la persistencia falló: %v", err)
+		}
+	}
 	return res
 }
 
