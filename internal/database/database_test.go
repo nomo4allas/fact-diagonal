@@ -58,29 +58,6 @@ func TestPersistSinCUFE(t *testing.T) {
 	}
 }
 
-// TestParseValor cubre el parseo de @valor desde el formato del XML UBL
-// ("119000.00") y el colombiano del texto nativo ("119.000,00").
-func TestParseValor(t *testing.T) {
-	casos := []struct {
-		in   string
-		want float64
-	}{
-		{"119000.00", 119000.00},
-		{"119.000,00", 119000.00},
-		{"1.234.567,89", 1234567.89},
-		{"1234567.89", 1234567.89},
-		{"$ 119.000,00", 119000.00},
-		{"1000", 1000},
-		{"", 0},
-		{"N/A", 0},
-	}
-	for _, k := range casos {
-		if got := parseValor(k.in); got != k.want {
-			t.Errorf("parseValor(%q) = %v, want %v", k.in, got, k.want)
-		}
-	}
-}
-
 // TestTruncar verifica el recorte por runas a los límites varchar del SP.
 func TestTruncar(t *testing.T) {
 	casos := []struct {

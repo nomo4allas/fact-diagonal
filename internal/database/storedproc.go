@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"database/sql"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +26,7 @@ const (
 	maxMandato       = 6
 	maxNombreAdjunto = 500
 	maxNotasAdjunto  = 500
-	maxExtension     = 6
+	maxExtension     = 10
 )
 
 // EstadoBD resume el desenlace de la persistencia de una factura; el pipeline lo
@@ -77,8 +76,6 @@ type spParams struct {
 	Operacion         int
 	Cufe              string
 	Radicado          int
-	Nit               string  // @nit (tipo_nit; se envía como varchar)
-	Valor             float64 // @valor numeric(18,2)
 	FechaHoraOriginal time.Time
 	Mandato           string
 	NotasAdjunto      *string // nil → NULL
@@ -109,12 +106,10 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 	}
 
 	fechaCol := aHoraColombia(fechaCorreo)
-	nit := strings.TrimSpace(data.NIT)
-	valor := parseValor(data.ValorTotal)
 	mandato := truncar(strings.TrimSpace(data.Pedido), maxMandato)
 
 	if c.simulation {
-		return c.simular(cufe, nit, valor, fechaCol, mandato, data.BL, adjuntos), nil
+		return c.simular(cufe, fechaCol, mandato, data.BL, adjuntos), nil
 	}
 
 	// 1) Operacion 0 — buscar por CUFE.
@@ -138,8 +133,6 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 		Operacion:         opActualizar,
 		Cufe:              cufe,
 		Radicado:          radicado,
-		Nit:               nit,
-		Valor:             valor,
 		FechaHoraOriginal: fechaCol,
 		Mandato:           mandato,
 	})
@@ -190,30 +183,46 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 	return Persistencia{Estado: estado, Radicado: radicado, Adjuntos: insertados}, nil
 }
 
-// callSP invoca el Stored Procedure por RPC con TODOS sus parámetros de entrada
-// (los no usados por la operación viajan con su valor cero / NULL) y lee los de
-// salida @Mensaje y @Resultado.
+// callSP invoca el Stored Procedure por RPC con los parámetros que aplican a la
+// operación (los que no aplican viajan como NULL) y lee los de salida @Mensaje y
+// @Resultado.
+//
+// Reparto de parámetros por operación:
+//   - @Cufe, @FechaHoraOriginal y @Mandato: aplican a la búsqueda (0) y la
+//     actualización (1); NULL en la inserción de adjunto (2).
+//   - @NotasAdjunto, @NombreAdjunto, @Extension y @Adjunto: solo aplican a la
+//     inserción de adjunto (2); NULL en las demás operaciones.
 func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje string, err error) {
-	var notas any // nil → NULL
-	if p.NotasAdjunto != nil {
-		notas = *p.NotasAdjunto
+	// Campos de factura: NULL en la Operacion 2 (insertar adjunto).
+	var cufe, fechaHora, mandato any // nil → NULL
+	if p.Operacion != opInsertarAdjunto {
+		cufe = p.Cufe
+		fechaHora = p.FechaHoraOriginal
+		mandato = p.Mandato
 	}
-	var adjunto any // nil → NULL
-	if len(p.Adjunto) > 0 {
-		adjunto = p.Adjunto
+
+	// Campos de adjunto: NULL salvo en la Operacion 2 (insertar adjunto).
+	var notas, nombreAdjunto, extension, adjunto any // nil → NULL
+	if p.Operacion == opInsertarAdjunto {
+		if p.NotasAdjunto != nil {
+			notas = *p.NotasAdjunto
+		}
+		nombreAdjunto = p.NombreAdjunto
+		extension = p.Extension
+		if len(p.Adjunto) > 0 {
+			adjunto = p.Adjunto
+		}
 	}
 
 	_, err = c.db.ExecContext(ctx, c.spName,
 		sql.Named("Operacion", p.Operacion),
-		sql.Named("Cufe", p.Cufe),
+		sql.Named("Cufe", cufe),
 		sql.Named("Radicado", p.Radicado),
-		sql.Named("nit", p.Nit),
-		sql.Named("valor", p.Valor),
-		sql.Named("FechaHoraOriginal", p.FechaHoraOriginal),
-		sql.Named("Mandato", p.Mandato),
+		sql.Named("FechaHoraOriginal", fechaHora),
+		sql.Named("Mandato", mandato),
 		sql.Named("NotasAdjunto", notas),
-		sql.Named("NombreAdjunto", p.NombreAdjunto),
-		sql.Named("Extension", p.Extension),
+		sql.Named("NombreAdjunto", nombreAdjunto),
+		sql.Named("Extension", extension),
 		sql.Named("Adjunto", adjunto),
 		sql.Named("Mensaje", sql.Out{Dest: &mensaje}),
 		sql.Named("Resultado", sql.Out{Dest: &resultado}),
@@ -228,10 +237,10 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 // ejecutarlo. Como no se llama a la Operacion 0, no hay radicado real: se usa el
 // marcador 0 y se asume el desenlace que tendría un flujo exitoso, para que la
 // clasificación de carpetas en simulación sea representativa.
-func (c *Client) simular(cufe, nit string, valor float64, fechaCol time.Time, mandato, bl string, adjuntos []Adjunto) Persistencia {
+func (c *Client) simular(cufe string, fechaCol time.Time, mandato, bl string, adjuntos []Adjunto) Persistencia {
 	c.log.Infof("    · BD [SIMULACIÓN] Operacion 0 (buscar) → SP %s(@Operacion=0, @Cufe=%s)", c.spName, cufe)
-	c.log.Infof("    · BD [SIMULACIÓN] Operacion 1 (actualizar) → SP %s(@Operacion=1, @Radicado=<Op0>, @Cufe=%s, @nit=%s, @valor=%.2f, @FechaHoraOriginal='%s' (UTC-5), @Mandato=%s)",
-		c.spName, cufe, orNULL(nit), valor, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
+	c.log.Infof("    · BD [SIMULACIÓN] Operacion 1 (actualizar) → SP %s(@Operacion=1, @Radicado=<Op0>, @Cufe=%s, @FechaHoraOriginal='%s' (UTC-5), @Mandato=%s)",
+		c.spName, cufe, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
 
 	insertables := 0
 	for _, a := range adjuntos {
@@ -264,53 +273,6 @@ func notasParaAdjunto(extension, bl string) *string {
 	}
 	s = truncar(s, maxNotasAdjunto)
 	return &s
-}
-
-// parseValor convierte el valor total de la factura (cadena) a float64 para
-// @valor. Soporta el formato del XML UBL ("119000.00") y el colombiano del texto
-// nativo ("119.000,00"); ante un valor no parseable devuelve 0.
-func parseValor(s string) float64 {
-	var b strings.Builder
-	for _, r := range strings.TrimSpace(s) {
-		if (r >= '0' && r <= '9') || r == '.' || r == ',' || r == '-' {
-			b.WriteRune(r)
-		}
-	}
-	v := b.String()
-	if v == "" {
-		return 0
-	}
-
-	lastDot := strings.LastIndexByte(v, '.')
-	lastComma := strings.LastIndexByte(v, ',')
-	switch {
-	case lastDot >= 0 && lastComma >= 0:
-		// El separador decimal es el que aparece más a la derecha; el otro es de miles.
-		if lastComma > lastDot {
-			v = strings.ReplaceAll(v, ".", "")
-			v = strings.ReplaceAll(v, ",", ".")
-		} else {
-			v = strings.ReplaceAll(v, ",", "")
-		}
-	case lastComma >= 0:
-		// Solo comas: una sola coma con <=2 decimales es separador decimal; si no, miles.
-		if strings.Count(v, ",") == 1 && len(v)-lastComma-1 <= 2 {
-			v = strings.ReplaceAll(v, ",", ".")
-		} else {
-			v = strings.ReplaceAll(v, ",", "")
-		}
-	default:
-		// Solo puntos: varios puntos son separadores de miles; uno solo se deja como decimal.
-		if strings.Count(v, ".") > 1 {
-			v = strings.ReplaceAll(v, ".", "")
-		}
-	}
-
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return 0
-	}
-	return f
 }
 
 // truncar recorta s a un máximo de max runas (los límites varchar del SP), sin
