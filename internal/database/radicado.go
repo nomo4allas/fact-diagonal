@@ -387,33 +387,64 @@ func (c *Client) scanRadicado(ctx context.Context, query string, args ...any) (R
 // updateRadicado actualiza los campos de recepción del registro automático hallado
 // y, por el ajuste Módulo 3 (req. 3), Mandato=Pedido y Explicacion=DECLARAC.
 // NUNCA inserta: solo modifica el registro existente identificado por IdDoc.
+//
+// Regla (ajuste): Mandato y Explicacion solo se incluyen en el UPDATE cuando el
+// valor extraído NO viene vacío. Si viene vacío, se omiten del SET para no pisar
+// un valor que ya pudiera existir en la BD.
 func (c *Client) updateRadicado(ctx context.Context, tx *sql.Tx, rec Radicado, data invoice.Data, fechaCol time.Time) error {
+	sets, args := setsUpdateRadicado(data, fechaCol, rec.IdDoc)
 	query := `
 UPDATE ` + c.tablaRadicado() + `
-SET ViaDeRecepcion    = @via,
-    FechaHoraOriginal = @fecha,
-    Usuario           = @usuario,
-    Pc                = @pc,
-    Mandato           = @mandato,
-    Explicacion       = @explicacion
+SET ` + strings.Join(sets, ",\n    ") + `
 WHERE IdDoc = @iddoc`
 
-	res, err := tx.ExecContext(ctx, query,
-		sql.Named("via", viaRecepcion),
-		sql.Named("fecha", fechaCol),
-		sql.Named("usuario", usuario),
-		sql.Named("pc", pc),
-		sql.Named("mandato", strings.TrimSpace(data.Pedido)),       // ajuste req. 3
-		sql.Named("explicacion", strings.TrimSpace(data.Declarac)), // ajuste req. 3
-		sql.Named("iddoc", rec.IdDoc),
-	)
+	res, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
-	c.log.Infof("    · BD: UPDATE radicado IdDoc=%d (%d fila(s)) → ViaDeRecepcion='%s', FechaHoraOriginal='%s' (UTC-5), Usuario='%s', Pc='%s', Mandato='%s', Explicacion='%s'",
-		rec.IdDoc, n, viaRecepcion, fechaCol.Format("2006-01-02 15:04:05"), usuario, pc, data.Pedido, data.Declarac)
+	c.log.Infof("    · BD: UPDATE radicado IdDoc=%d (%d fila(s)) → ViaDeRecepcion='%s', FechaHoraOriginal='%s' (UTC-5), Usuario='%s', Pc='%s', Mandato=%s, Explicacion=%s",
+		rec.IdDoc, n, viaRecepcion, fechaCol.Format("2006-01-02 15:04:05"), usuario, pc, campoOpcionalLog(data.Pedido), campoOpcionalLog(data.Declarac))
 	return nil
+}
+
+// setsUpdateRadicado arma las asignaciones y los argumentos del UPDATE del
+// radicado. Los campos de recepción (ViaDeRecepcion, FechaHoraOriginal, Usuario,
+// Pc) van siempre; Mandato (Pedido) y Explicacion (DECLARAC) solo se agregan si
+// el valor extraído no viene vacío, para no sobrescribir lo que ya haya en la BD.
+func setsUpdateRadicado(data invoice.Data, fechaCol time.Time, iddoc int64) (sets []string, args []any) {
+	sets = []string{
+		"ViaDeRecepcion    = @via",
+		"FechaHoraOriginal = @fecha",
+		"Usuario           = @usuario",
+		"Pc                = @pc",
+	}
+	args = []any{
+		sql.Named("via", viaRecepcion),
+		sql.Named("fecha", fechaCol),
+		sql.Named("usuario", usuario),
+		sql.Named("pc", pc),
+		sql.Named("iddoc", iddoc),
+	}
+	if mandato := strings.TrimSpace(data.Pedido); mandato != "" { // ajuste req. 3
+		sets = append(sets, "Mandato = @mandato")
+		args = append(args, sql.Named("mandato", mandato))
+	}
+	if explicacion := strings.TrimSpace(data.Declarac); explicacion != "" { // ajuste req. 3
+		sets = append(sets, "Explicacion = @explicacion")
+		args = append(args, sql.Named("explicacion", explicacion))
+	}
+	return sets, args
+}
+
+// campoOpcionalLog formatea Mandato/Explicacion para el log: el valor entre
+// comillas si se actualiza, o "(omitido: vacío)" si se dejó fuera del UPDATE por
+// venir vacío (regla: no pisar lo que ya exista en la BD).
+func campoOpcionalLog(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "(omitido: vacío)"
+	}
+	return "'" + strings.TrimSpace(v) + "'"
 }
 
 // insertAdjunto inserta un archivo (PDF o XML) en dbo.Adjuntos.
@@ -436,29 +467,48 @@ VALUES
 		sql.Named("adjunto", a.Contenido),
 		sql.Named("ext", a.Extension),
 		sql.Named("kl", cufe),
-		sql.Named("notas", strings.TrimSpace(bl)), // ajuste req. 5: BL
+		sql.Named("notas", notasAdjuntoSQL(bl)), // ajuste req. 5: BL (NULL si viene vacío)
 	)
 	if err != nil {
 		return err
 	}
-	c.log.Infof("    · BD: INSERT Adjuntos OK (IdFuente=%s, %s '%s', %d bytes, NotasAdjunto='%s')",
-		idFuente, a.Extension, a.Nombre, len(a.Contenido), bl)
+	c.log.Infof("    · BD: INSERT Adjuntos OK (IdFuente=%s, %s '%s', %d bytes, NotasAdjunto=%s)",
+		idFuente, a.Extension, a.Nombre, len(a.Contenido), notasAdjuntoLog(bl))
 	return nil
+}
+
+// notasAdjuntoSQL devuelve el valor a escribir en NotasAdjunto: el BL (sin
+// espacios) si tiene valor, o nil (→ NULL en SQL) si viene vacío, para no dejar
+// cadenas vacías en la columna.
+func notasAdjuntoSQL(bl string) any {
+	if s := strings.TrimSpace(bl); s != "" {
+		return s
+	}
+	return nil
+}
+
+// notasAdjuntoLog formatea NotasAdjunto para el log: 'valor' si se escribe el BL,
+// o NULL si viene vacío.
+func notasAdjuntoLog(bl string) string {
+	if s := strings.TrimSpace(bl); s != "" {
+		return "'" + s + "'"
+	}
+	return "NULL"
 }
 
 // logSimulacionAuto registra el UPDATE/INSERT que se harían para un registro
 // automático, sin tocar la base.
 func (c *Client) logSimulacionAuto(rec Radicado, data invoice.Data, fechaCol time.Time, adjuntos []Adjunto) {
-	c.log.Infof("    · BD [SIMULACIÓN] UPDATE %s SET ViaDeRecepcion='%s', FechaHoraOriginal='%s' (hora Colombia UTC-5), Usuario='%s', Pc='%s', Mandato='%s', Explicacion='%s' WHERE IdDoc=%d",
-		tablaFuente, viaRecepcion, fechaCol.Format("2006-01-02 15:04:05"), usuario, pc, data.Pedido, data.Declarac, rec.IdDoc)
+	c.log.Infof("    · BD [SIMULACIÓN] UPDATE %s SET ViaDeRecepcion='%s', FechaHoraOriginal='%s' (hora Colombia UTC-5), Usuario='%s', Pc='%s', Mandato=%s, Explicacion=%s WHERE IdDoc=%d",
+		tablaFuente, viaRecepcion, fechaCol.Format("2006-01-02 15:04:05"), usuario, pc, campoOpcionalLog(data.Pedido), campoOpcionalLog(data.Declarac), rec.IdDoc)
 	cufe := strings.TrimSpace(data.CUFE)
 	for _, a := range adjuntos {
 		if len(a.Contenido) == 0 {
 			c.log.Infof("    · BD [SIMULACIÓN] adjunto %q vacío, se omitiría", a.Nombre)
 			continue
 		}
-		c.log.Infof("    · BD [SIMULACIÓN] INSERT Adjuntos (IdFuente=%s, BaseDatosFuente='%s', TablaFuente='%s', NombreAdjunto='%s', Extension='%s', KlFuente='%s', NotasAdjunto='%s', Adjunto=%d bytes)",
-			rec.Radicado, baseDatosFuente, tablaFuente, a.Nombre, a.Extension, cufe, data.BL, len(a.Contenido))
+		c.log.Infof("    · BD [SIMULACIÓN] INSERT Adjuntos (IdFuente=%s, BaseDatosFuente='%s', TablaFuente='%s', NombreAdjunto='%s', Extension='%s', KlFuente='%s', NotasAdjunto=%s, Adjunto=%d bytes)",
+			rec.Radicado, baseDatosFuente, tablaFuente, a.Nombre, a.Extension, cufe, notasAdjuntoLog(data.BL), len(a.Contenido))
 	}
 }
 

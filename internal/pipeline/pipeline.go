@@ -230,16 +230,21 @@ func (p *Processor) cascadePDF(ctx context.Context, pdf []byte) (invoice.Data, [
 	// Los campos adicionales del PDF (Pedido/Declarac/BL) no cuentan para
 	// IsComplete()/richer, así que los acumulamos aparte para que no se pierdan
 	// cuando un eslabón posterior, más rico en campos clave, reemplace a "best".
+	//
+	// Prioridad de fuentes (ajuste): Gemini > OCR > texto nativo. Como los eslabones
+	// corren en ese orden inverso de confianza (nativo → OCR → Gemini), basta con
+	// que gane el ÚLTIMO valor no vacío: así el regex heurístico del texto nativo es
+	// solo respaldo y Gemini (más fiable) tiene la última palabra.
 	var extras invoice.Data
 
 	acumularExtras := func(d invoice.Data) {
-		if strings.TrimSpace(extras.Pedido) == "" {
+		if strings.TrimSpace(d.Pedido) != "" {
 			extras.Pedido = d.Pedido
 		}
-		if strings.TrimSpace(extras.Declarac) == "" {
+		if strings.TrimSpace(d.Declarac) != "" {
 			extras.Declarac = d.Declarac
 		}
-		if strings.TrimSpace(extras.BL) == "" {
+		if strings.TrimSpace(d.BL) != "" {
 			extras.BL = d.BL
 		}
 	}

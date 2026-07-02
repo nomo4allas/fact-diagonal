@@ -65,3 +65,37 @@ N° BL: HLCU12345`
 		}
 	})
 }
+
+// TestParseFalsosPositivosExtras reproduce los falsos positivos observados en la
+// corrida real contra el buzón y verifica que los regex endurecidos ya no los
+// capturan (misma línea + \b en BL + palabras reservadas).
+func TestParseFalsosPositivosExtras(t *testing.T) {
+	t.Run("FECHA no es Pedido (valor en la línea siguiente)", func(t *testing.T) {
+		// "PEDIDO No:" al final de la línea; el valor real está en otra celda.
+		d := Parse("PEDIDO No:\nFECHA DE VENCIMIENTO 2026-07-01")
+		if d.Pedido != "" {
+			t.Errorf("Pedido = %q, want vacío (no debe cruzar salto de línea)", d.Pedido)
+		}
+	})
+
+	t.Run("DECLARAC no es BL (palabra reservada)", func(t *testing.T) {
+		d := Parse("N° BL: DECLARAC 92352601746687")
+		if d.BL != "" {
+			t.Errorf("BL = %q, want vacío (DECLARAC es palabra reservada)", d.BL)
+		}
+	})
+
+	t.Run("ANQ no es BL (sin token BL real)", func(t *testing.T) {
+		d := Parse("Cliente Amable ANQ 5 unidades")
+		if d.BL != "" {
+			t.Errorf("BL = %q, want vacío (no hay token BL, 'bl' va embebido)", d.BL)
+		}
+	})
+
+	t.Run("igar no es BL ('bl' embebido en Obligaciones)", func(t *testing.T) {
+		d := Parse("Cumplimiento de Obligaciones igar")
+		if d.BL != "" {
+			t.Errorf("BL = %q, want vacío ('bl' de Obligaciones no es token BL)", d.BL)
+		}
+	})
+}
