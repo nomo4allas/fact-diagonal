@@ -126,11 +126,11 @@ func main() {
 	}
 
 	// Límite de seguridad: procesar como máximo este número de correos por
-	// corrida (útil para pruebas controladas en modo simulación).
-	const maxCorreos = 5
-	if len(withAtt) > maxCorreos {
-		lg.Infof("Limitando a los primeros %d correos (de %d) para esta corrida.", maxCorreos, len(withAtt))
-		withAtt = withAtt[:maxCorreos]
+	// corrida (configurable con MAX_CORREOS; por defecto 5). Útil para pruebas
+	// controladas en modo simulación.
+	if len(withAtt) > cfg.MaxCorreos {
+		lg.Infof("Limitando a los primeros %d correos (de %d) para esta corrida.", cfg.MaxCorreos, len(withAtt))
+		withAtt = withAtt[:cfg.MaxCorreos]
 	}
 
 	if cfg.GeminiAPIKey == "" {
