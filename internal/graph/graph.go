@@ -3,6 +3,7 @@
 package graph
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -188,4 +190,153 @@ func (c *Client) ListAttachments(ctx context.Context, mailbox, messageID string)
 		return nil, fmt.Errorf("error decodificando los adjuntos de Graph: %w", err)
 	}
 	return out.Value, nil
+}
+
+// ---------------------------------------------------------------------------
+// Manejo de carpetas del buzón (ajuste "lógica de carpetas").
+//
+// Las carpetas destino (Procesados/Pendientes/Errores) son SUBCARPETAS de Inbox.
+// ResolveInboxChildFolder las localiza por displayName y las crea si no existen;
+// MoveMessage mueve un correo a una carpeta. Ambas operaciones ESCRIBEN en el
+// buzón, por lo que el llamador debe respetar SIMULATION_MODE (no invocarlas en
+// simulación, solo registrar en el log lo que haría).
+// ---------------------------------------------------------------------------
+
+// mailFolder es la representación reducida de una carpeta de correo.
+type mailFolder struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+}
+
+type mailFoldersResponse struct {
+	Value    []mailFolder `json:"value"`
+	NextLink string       `json:"@odata.nextLink"`
+}
+
+// ResolveInboxChildFolder devuelve el ID de la subcarpeta de Inbox con el
+// displayName indicado, creándola si no existe. La comparación de nombre es
+// case-insensitive.
+func (c *Client) ResolveInboxChildFolder(ctx context.Context, mailbox, displayName string) (string, error) {
+	id, found, err := c.findInboxChildFolder(ctx, mailbox, displayName)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return id, nil
+	}
+	return c.createInboxChildFolder(ctx, mailbox, displayName)
+}
+
+// findInboxChildFolder busca (siguiendo la paginación) una subcarpeta de Inbox
+// por displayName.
+func (c *Client) findInboxChildFolder(ctx context.Context, mailbox, displayName string) (string, bool, error) {
+	q := url.Values{}
+	q.Set("$select", "id,displayName")
+	q.Set("$top", "100")
+	next := fmt.Sprintf("%s/users/%s/mailFolders/Inbox/childFolders?%s",
+		baseURL, url.PathEscape(mailbox), q.Encode())
+
+	for next != "" {
+		body, err := c.doGET(ctx, next)
+		if err != nil {
+			return "", false, fmt.Errorf("error listando subcarpetas de Inbox: %w", err)
+		}
+		var out mailFoldersResponse
+		if err := json.Unmarshal(body, &out); err != nil {
+			return "", false, fmt.Errorf("error decodificando subcarpetas de Inbox: %w", err)
+		}
+		for _, f := range out.Value {
+			if strings.EqualFold(f.DisplayName, displayName) {
+				return f.ID, true, nil
+			}
+		}
+		next = out.NextLink
+	}
+	return "", false, nil
+}
+
+// createInboxChildFolder crea una subcarpeta bajo Inbox y devuelve su ID.
+func (c *Client) createInboxChildFolder(ctx context.Context, mailbox, displayName string) (string, error) {
+	rawURL := fmt.Sprintf("%s/users/%s/mailFolders/Inbox/childFolders",
+		baseURL, url.PathEscape(mailbox))
+	payload, err := json.Marshal(map[string]string{"displayName": displayName})
+	if err != nil {
+		return "", fmt.Errorf("error serializando la creación de carpeta %q: %w", displayName, err)
+	}
+	body, err := c.doJSON(ctx, http.MethodPost, rawURL, payload, http.StatusCreated, http.StatusOK)
+	if err != nil {
+		return "", fmt.Errorf("error creando la subcarpeta %q: %w", displayName, err)
+	}
+	var f mailFolder
+	if err := json.Unmarshal(body, &f); err != nil {
+		return "", fmt.Errorf("error decodificando la carpeta creada %q: %w", displayName, err)
+	}
+	return f.ID, nil
+}
+
+// MoveMessage mueve un correo a la carpeta destino indicada por su ID. Graph
+// devuelve el mensaje ya movido (con un nuevo id) en la carpeta destino.
+func (c *Client) MoveMessage(ctx context.Context, mailbox, messageID, destFolderID string) error {
+	rawURL := fmt.Sprintf("%s/users/%s/messages/%s/move",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(messageID))
+	payload, err := json.Marshal(map[string]string{"destinationId": destFolderID})
+	if err != nil {
+		return fmt.Errorf("error serializando el move del correo: %w", err)
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, rawURL, payload, http.StatusCreated, http.StatusOK); err != nil {
+		return fmt.Errorf("error moviendo el correo a la carpeta destino: %w", err)
+	}
+	return nil
+}
+
+// doGET ejecuta un GET autenticado y devuelve el cuerpo si la respuesta es 200.
+func (c *Client) doGET(ctx context.Context, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error construyendo la petición: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error llamando a Graph: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error leyendo la respuesta de Graph: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Graph respondió %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
+}
+
+// doJSON ejecuta una petición con cuerpo JSON y devuelve el cuerpo de la
+// respuesta si su código está entre los okStatus indicados.
+func (c *Client) doJSON(ctx context.Context, method, rawURL string, payload []byte, okStatus ...int) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("error construyendo la petición: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error llamando a Graph: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error leyendo la respuesta de Graph: %w", err)
+	}
+	for _, ok := range okStatus {
+		if resp.StatusCode == ok {
+			return body, nil
+		}
+	}
+	return nil, fmt.Errorf("Graph respondió %d: %s", resp.StatusCode, string(body))
 }

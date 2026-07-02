@@ -54,18 +54,56 @@ func New(gc *graph.Client, gem *gemini.Client, db *database.Client, log Logger, 
 
 // Result reúne lo extraído de un bundle: los datos por fuente y el consolidado.
 type Result struct {
-	Origin string       // adjunto de origen
+	Origin  string       // adjunto de origen
 	XMLData invoice.Data // datos del XML (vacío si no había XML)
 	PDFData invoice.Data // mejor resultado de la cascada de PDF
 	Final   invoice.Data // consolidado (XML autoritativo + respaldo del PDF)
 }
 
+// Outcome clasifica el desenlace de un correo para decidir su carpeta destino
+// (ajuste "lógica de carpetas"). El valor entero codifica la severidad: al
+// agregar varios bundles de un mismo correo se conserva el de mayor severidad.
+type Outcome int
+
+const (
+	// Procesados: procesamiento exitoso completo.
+	Procesados Outcome = iota
+	// Pendientes: CUFE no encontrado en BD, o 0 adjuntos insertados ("SP devuelve 0").
+	Pendientes
+	// Errores: error técnico (PDF ilegible, fallo de conexión, etc.) o correo sin
+	// adjunto de factura válido.
+	Errores
+)
+
+// Folder devuelve el nombre de la subcarpeta de Inbox asociada al desenlace.
+func (o Outcome) Folder() string {
+	switch o {
+	case Procesados:
+		return "Procesados"
+	case Pendientes:
+		return "Pendientes"
+	default:
+		return "Errores"
+	}
+}
+
+// peor devuelve el desenlace de mayor severidad entre dos.
+func peor(a, b Outcome) Outcome {
+	if b > a {
+		return b
+	}
+	return a
+}
+
 // ProcessMessage descarga los adjuntos del correo, extrae los datos de cada
-// factura y los registra en el log. Devuelve los resultados consolidados.
-func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg graph.Message) ([]Result, error) {
+// factura, los registra en el log y (Módulo 3) los persiste. Devuelve los
+// resultados consolidados y el desenlace agregado del correo (Outcome), que el
+// llamador usa para decidir la carpeta destino.
+func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg graph.Message) ([]Result, Outcome, error) {
 	atts, err := p.graph.ListAttachments(ctx, mailbox, msg.ID)
 	if err != nil {
-		return nil, fmt.Errorf("no se pudieron descargar los adjuntos: %w", err)
+		// Fallo técnico al descargar adjuntos → Errores.
+		return nil, Errores, fmt.Errorf("no se pudieron descargar los adjuntos: %w", err)
 	}
 
 	var bundles []attachment.Bundle
@@ -96,21 +134,26 @@ func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg grap
 	}
 
 	if len(bundles) == 0 {
+		// Correo sin adjunto de factura válido → Errores.
 		p.log.Infof("    · sin adjuntos procesables (ZIP/PDF) en este correo")
-		return nil, nil
+		return nil, Errores, nil
 	}
 
 	var results []Result
+	outcome := Procesados
 	for _, b := range bundles {
-		results = append(results, p.processBundle(ctx, b, msg.ReceivedDateTime))
+		res, o := p.processBundle(ctx, b, msg.ReceivedDateTime)
+		results = append(results, res)
+		outcome = peor(outcome, o)
 	}
-	return results, nil
+	return results, outcome, nil
 }
 
 // processBundle extrae los datos de un bundle (un PDF y/o un XML), los logea y,
 // si la BD está activa, los persiste (Módulo 3). fechaCorreo es la fecha de
-// recepción del correo, usada para FechaHoraOriginal.
-func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fechaCorreo time.Time) Result {
+// recepción del correo, usada para FechaHoraOriginal. Devuelve, además del
+// resultado, el desenlace (Outcome) para la clasificación de carpetas.
+func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fechaCorreo time.Time) (Result, Outcome) {
 	res := Result{Origin: b.Origin}
 
 	// 1) XML UBL: fuente autoritativa.
@@ -139,20 +182,44 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	p.logDiscrepancies(res)
 	p.logFinal(res.Final)
 
-	// 4) Módulo 3: persistir en SQL Server (si está configurado).
-	if p.db != nil {
-		var adjuntos []database.Adjunto
-		if b.HasPDF() {
-			adjuntos = append(adjuntos, database.Adjunto{Nombre: b.PDFName, Extension: "pdf", Contenido: b.PDF})
-		}
-		if b.HasXML() {
-			adjuntos = append(adjuntos, database.Adjunto{Nombre: b.XMLName, Extension: "xml", Contenido: b.XML})
-		}
-		if err := p.db.PersistInvoice(ctx, res.Final, fechaCorreo, adjuntos); err != nil {
-			p.log.Errorf("    · BD: la persistencia falló: %v", err)
-		}
+	// Si no se pudo extraer ningún campo clave, tratamos el bundle como error
+	// técnico (PDF ilegible / sin datos aprovechables) → Errores. No se toca la BD.
+	if res.Final.FilledCount() == 0 {
+		p.log.Errorf("    · sin datos aprovechables en el bundle %q (PDF ilegible/vacío) → Errores", b.Origin)
+		return res, Errores
 	}
-	return res
+
+	// 4) Módulo 3: persistir en SQL Server (si está configurado).
+	if p.db == nil {
+		// Sin Módulo 3 no hay verificación en BD; con la extracción exitosa el
+		// correo se considera procesado.
+		return res, Procesados
+	}
+
+	var adjuntos []database.Adjunto
+	if b.HasPDF() {
+		adjuntos = append(adjuntos, database.Adjunto{Nombre: b.PDFName, Extension: "pdf", Contenido: b.PDF})
+	}
+	if b.HasXML() {
+		adjuntos = append(adjuntos, database.Adjunto{Nombre: b.XMLName, Extension: "xml", Contenido: b.XML})
+	}
+	persist, err := p.db.PersistInvoice(ctx, res.Final, fechaCorreo, adjuntos)
+	if err != nil {
+		// Fallo técnico de BD (p.ej. conexión) → Errores.
+		p.log.Errorf("    · BD: la persistencia falló: %v", err)
+		return res, Errores
+	}
+	return res, outcomeDeEstado(persist.Estado)
+}
+
+// outcomeDeEstado traduce el desenlace de la BD (Módulo 3) a la carpeta destino.
+func outcomeDeEstado(e database.EstadoBD) Outcome {
+	switch e {
+	case database.EstadoProcesado:
+		return Procesados
+	default: // EstadoNoHallado (CUFE no encontrado) o EstadoPendiente (0 adjuntos)
+		return Pendientes
+	}
 }
 
 // cascadePDF aplica los tres eslabones en orden, deteniéndose en cuanto un
@@ -160,15 +227,44 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 func (p *Processor) cascadePDF(ctx context.Context, pdf []byte) (invoice.Data, []string) {
 	var notes []string
 	best := invoice.Data{}
+	// Los campos adicionales del PDF (Pedido/Declarac/BL) no cuentan para
+	// IsComplete()/richer, así que los acumulamos aparte para que no se pierdan
+	// cuando un eslabón posterior, más rico en campos clave, reemplace a "best".
+	var extras invoice.Data
+
+	acumularExtras := func(d invoice.Data) {
+		if strings.TrimSpace(extras.Pedido) == "" {
+			extras.Pedido = d.Pedido
+		}
+		if strings.TrimSpace(extras.Declarac) == "" {
+			extras.Declarac = d.Declarac
+		}
+		if strings.TrimSpace(extras.BL) == "" {
+			extras.BL = d.BL
+		}
+	}
+	aplicarExtras := func(d invoice.Data) invoice.Data {
+		if strings.TrimSpace(d.Pedido) == "" {
+			d.Pedido = extras.Pedido
+		}
+		if strings.TrimSpace(d.Declarac) == "" {
+			d.Declarac = extras.Declarac
+		}
+		if strings.TrimSpace(d.BL) == "" {
+			d.BL = extras.BL
+		}
+		return d
+	}
 
 	// Eslabón 1: texto nativo.
 	if d, _, err := pdftext.Extract(pdf); err != nil {
 		notes = append(notes, "texto nativo omitido: "+err.Error())
 	} else {
 		notes = append(notes, fmt.Sprintf("texto nativo: %d/6 campos", d.FilledCount()))
+		acumularExtras(d)
 		best = richer(best, d)
 		if best.IsComplete() {
-			return best, notes
+			return aplicarExtras(best), notes
 		}
 	}
 
@@ -178,9 +274,10 @@ func (p *Processor) cascadePDF(ctx context.Context, pdf []byte) (invoice.Data, [
 			notes = append(notes, "OCR falló: "+err.Error())
 		} else {
 			notes = append(notes, fmt.Sprintf("OCR: %d/6 campos", d.FilledCount()))
+			acumularExtras(d)
 			best = richer(best, d)
 			if best.IsComplete() {
-				return best, notes
+				return aplicarExtras(best), notes
 			}
 		}
 	} else {
@@ -193,13 +290,14 @@ func (p *Processor) cascadePDF(ctx context.Context, pdf []byte) (invoice.Data, [
 			notes = append(notes, "Gemini falló: "+err.Error())
 		} else {
 			notes = append(notes, fmt.Sprintf("Gemini: %d/6 campos", d.FilledCount()))
+			acumularExtras(d)
 			best = richer(best, d)
 		}
 	} else {
 		notes = append(notes, "Gemini omitido (GEMINI_API_KEY vacía)")
 	}
 
-	return best, notes
+	return aplicarExtras(best), notes
 }
 
 // consolidate combina XML (autoritativo) y PDF (respaldo). Si no hay XML,
@@ -247,6 +345,10 @@ func (p *Processor) logFinal(d invoice.Data) {
 	p.log.Infof("       Fecha emisión  : %s", orNA(d.FechaEmision))
 	p.log.Infof("       Valor total    : %s", orNA(d.ValorTotal))
 	p.log.Infof("       CUFE           : %s", orNA(d.CUFE))
+	// Campos adicionales del PDF (ajuste Módulo 2).
+	p.log.Infof("       Pedido         : %s", orNA(d.Pedido))
+	p.log.Infof("       DECLARAC       : %s", orNA(d.Declarac))
+	p.log.Infof("       BL             : %s", orNA(d.BL))
 	if miss := d.MissingFields(); len(miss) > 0 {
 		p.log.Infof("       (incompleto, faltan: %s)", strings.Join(miss, ", "))
 	}

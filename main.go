@@ -170,6 +170,23 @@ func main() {
 	gem := gemini.New(cfg.GeminiAPIKey)
 	proc := pipeline.New(gc, gem, db, lg, cfg.SimulationMode)
 
+	// Ajuste "lógica de carpetas": resolvemos (creándolas si faltan) las
+	// subcarpetas de Inbox destino. Solo fuera de simulación: en SIMULATION_MODE
+	// no se crea ni se mueve nada, solo se registra el destino en el log.
+	var carpetas map[string]string // nombre → folderID
+	if !cfg.SimulationMode {
+		carpetas = make(map[string]string, 3)
+		for _, name := range []string{"Procesados", "Pendientes", "Errores"} {
+			id, err := gc.ResolveInboxChildFolder(ctx, cfg.Mailbox, name)
+			if err != nil {
+				lg.Errorf("no se pudo resolver/crear la carpeta /%s: %v", name, err)
+				continue
+			}
+			carpetas[name] = id
+			lg.Infof("Carpeta destino /%s lista.", name)
+		}
+	}
+
 	procesadas := 0
 	for i, m := range withAtt {
 		subject := m.Subject
@@ -179,16 +196,29 @@ func main() {
 		lg.Infof("========================================")
 		lg.Infof("[%d/%d] Procesando: %s — %s", i+1, len(withAtt), subject, m.SenderName())
 
-		results, err := proc.ProcessMessage(ctx, cfg.Mailbox, m)
+		results, outcome, err := proc.ProcessMessage(ctx, cfg.Mailbox, m)
 		if err != nil {
+			// El desenlace ya viene como Errores; seguimos para clasificarlo.
 			lg.Errorf("    error procesando el correo: %v", err)
-			continue
 		}
 		procesadas += len(results)
 
+		// Clasificación de carpeta según el desenlace del correo.
+		carpeta := outcome.Folder()
 		if cfg.SimulationMode {
-			lg.Infof("    (modo simulación: el correo NO se mueve ni se marca como leído)")
+			lg.Infof("    [SIMULACIÓN] el correo se movería a /%s (no se mueve ni se marca como leído)", carpeta)
+			continue
 		}
+		destID, ok := carpetas[carpeta]
+		if !ok {
+			lg.Errorf("    no se movió el correo: la carpeta /%s no está disponible", carpeta)
+			continue
+		}
+		if err := gc.MoveMessage(ctx, cfg.Mailbox, m.ID, destID); err != nil {
+			lg.Errorf("    no se pudo mover el correo a /%s: %v", carpeta, err)
+			continue
+		}
+		lg.Infof("    correo movido a /%s ✓", carpeta)
 	}
 
 	lg.Infof("========================================")

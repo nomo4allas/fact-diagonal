@@ -30,6 +30,16 @@ type Data struct {
 	ValorTotal   string // valor total a pagar
 	CUFE         string // código único de factura electrónica
 	Source       Source // origen de esta extracción
+
+	// Campos adicionales extraídos del PDF (ajuste Módulo 2). No forman parte de
+	// los camposClave: son datos operativos que no condicionan si una factura se
+	// considera "completa", pero se persisten en el Módulo 3:
+	//   - Pedido    → Man_RadicadoFacturas_Test.Mandato
+	//   - Declarac  → Man_RadicadoFacturas_Test.Explicacion
+	//   - BL        → Adjuntos.NotasAdjunto
+	Pedido   string // "PEDIDO No:" del PDF
+	Declarac string // "DECLARAC:" del PDF
+	BL       string // Bill of Lading: "DOCTTE:" o "N° BL:" del PDF
 }
 
 // camposClave son los campos que consideramos imprescindibles para dar una
@@ -98,6 +108,17 @@ func (d Data) Merge(other Data) Data {
 	}
 	if strings.TrimSpace(out.CUFE) == "" {
 		out.CUFE = other.CUFE
+	}
+	// Campos adicionales del PDF (ajuste Módulo 2): el XML no los trae, así que
+	// se rellenan desde el PDF durante la consolidación.
+	if strings.TrimSpace(out.Pedido) == "" {
+		out.Pedido = other.Pedido
+	}
+	if strings.TrimSpace(out.Declarac) == "" {
+		out.Declarac = other.Declarac
+	}
+	if strings.TrimSpace(out.BL) == "" {
+		out.BL = other.BL
 	}
 	return out
 }

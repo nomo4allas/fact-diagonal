@@ -35,7 +35,7 @@ const (
 // prompt pide a Gemini un JSON estricto con los campos de interés.
 const prompt = `Eres un extractor de datos de facturas electrónicas colombianas (DIAN).
 Del documento PDF adjunto, devuelve EXCLUSIVAMENTE un objeto JSON válido, sin texto adicional ni bloques de código, con estas claves:
-{"numero":"","prefijo":"","nit":"","razon_social":"","fecha_emision":"","valor_total":"","cufe":""}
+{"numero":"","prefijo":"","nit":"","razon_social":"","fecha_emision":"","valor_total":"","cufe":"","pedido":"","declarac":"","bl":""}
 Reglas:
 - "numero": número de la factura tal cual aparece (incluye prefijo si lo tiene).
 - "prefijo": prefijo alfabético de la numeración, si existe.
@@ -44,6 +44,9 @@ Reglas:
 - "fecha_emision": en formato YYYY-MM-DD.
 - "valor_total": valor total a pagar, solo el número.
 - "cufe": el código CUFE.
+- "pedido": el número de pedido, suele aparecer como "PEDIDO No:".
+- "declarac": el valor de "DECLARAC:".
+- "bl": el Bill of Lading, aparece como "DOCTTE:" o "N° BL:" según el proveedor.
 Si un dato no aparece, deja su valor como cadena vacía.`
 
 // Client habla con la API de Gemini.
@@ -104,6 +107,10 @@ type fields struct {
 	FechaEmision string `json:"fecha_emision"`
 	ValorTotal   string `json:"valor_total"`
 	CUFE         string `json:"cufe"`
+	// Ajuste Módulo 2 — campos adicionales del PDF.
+	Pedido   string `json:"pedido"`
+	Declarac string `json:"declarac"`
+	BL       string `json:"bl"`
 }
 
 // Extract envía el PDF a Gemini y devuelve los campos extraídos.
@@ -160,6 +167,10 @@ func (c *Client) Extract(ctx context.Context, pdf []byte) (invoice.Data, error) 
 		ValorTotal:   strings.TrimSpace(f.ValorTotal),
 		CUFE:         strings.TrimSpace(f.CUFE),
 		Source:       invoice.SourceGemini,
+		// Ajuste Módulo 2 — campos adicionales del PDF.
+		Pedido:   strings.TrimSpace(f.Pedido),
+		Declarac: strings.TrimSpace(f.Declarac),
+		BL:       strings.TrimSpace(f.BL),
 	}
 	d.DerivePrefijo()
 	return d, nil

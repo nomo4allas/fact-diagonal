@@ -28,6 +28,14 @@ var (
 
 	// Valor total: "Total $ 1.234.567,00".
 	reTotal = regexp.MustCompile(`(?i)(?:valor\s+)?(?:total\s+(?:a\s+pagar|factura|neto)?|total)\D{0,6}\$?\s*([\d][\d\.,]{2,})`)
+
+	// Ajuste Módulo 2 — campos adicionales del PDF.
+	// PEDIDO: "PEDIDO No: 12345" (admite "No", "No.", "N°", "Nro" o nada).
+	rePedido = regexp.MustCompile(`(?i)pedido\s*(?:n[o°º\.]*|nro\.?|n[uú]mero)?\s*:?\s*([A-Z0-9][A-Z0-9\-/]{1,29})`)
+	// DECLARAC: "DECLARAC: ABC-123".
+	reDeclarac = regexp.MustCompile(`(?i)declarac(?:i[oó]n)?\s*:?\s*([A-Z0-9][A-Z0-9\-/]{1,29})`)
+	// BL / Bill of Lading: aparece como "DOCTTE:" o "N° BL:" según el proveedor.
+	reBL = regexp.MustCompile(`(?i)(?:doctte|(?:n[o°º\.]*\s*)?b\.?\s*l\.?|bill\s+of\s+lading)\s*:?\s*([A-Z0-9][A-Z0-9\-/]{2,29})`)
 )
 
 // Parse devuelve los campos detectables en el texto. El Source debe fijarlo el
@@ -55,6 +63,17 @@ func Parse(text string) invoice.Data {
 
 	if m := reTotal.FindStringSubmatch(text); m != nil {
 		d.ValorTotal = strings.TrimSpace(m[1])
+	}
+
+	// Ajuste Módulo 2 — campos adicionales del PDF.
+	if m := rePedido.FindStringSubmatch(text); m != nil {
+		d.Pedido = strings.TrimSpace(m[1])
+	}
+	if m := reDeclarac.FindStringSubmatch(text); m != nil {
+		d.Declarac = strings.TrimSpace(m[1])
+	}
+	if m := reBL.FindStringSubmatch(text); m != nil {
+		d.BL = strings.TrimSpace(m[1])
 	}
 
 	d.DerivePrefijo()
