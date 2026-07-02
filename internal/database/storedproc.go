@@ -10,10 +10,10 @@ import (
 	"github.com/nomo4allas/fact-diagonal/internal/invoice"
 )
 
-// nombreSP es el Stored Procedure del cliente que resuelve TODA la lógica del
-// Módulo 3. Se invoca por RPC (el texto del comando es solo el nombre del SP)
-// para poder leer sus parámetros de salida @Mensaje y @Resultado.
-const nombreSP = "Spd_IA_DocumentosElectronicos"
+// El Stored Procedure que resuelve TODA la lógica del Módulo 3 es configurable
+// (Client.spName; SP_NAME en config.env). Se invoca por RPC (el texto del comando
+// es solo el nombre del SP) para poder leer sus parámetros de salida @Mensaje y
+// @Resultado.
 
 // Operaciones soportadas por el SP.
 const (
@@ -203,7 +203,7 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 		adjunto = p.Adjunto
 	}
 
-	_, err = c.db.ExecContext(ctx, nombreSP,
+	_, err = c.db.ExecContext(ctx, c.spName,
 		sql.Named("Operacion", p.Operacion),
 		sql.Named("Cufe", p.Cufe),
 		sql.Named("Radicado", p.Radicado),
@@ -229,9 +229,9 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 // marcador 0 y se asume el desenlace que tendría un flujo exitoso, para que la
 // clasificación de carpetas en simulación sea representativa.
 func (c *Client) simular(cufe, nit string, valor float64, fechaCol time.Time, mandato, bl string, adjuntos []Adjunto) Persistencia {
-	c.log.Infof("    · BD [SIMULACIÓN] Operacion 0 (buscar) → SP %s(@Operacion=0, @Cufe=%s)", nombreSP, cufe)
+	c.log.Infof("    · BD [SIMULACIÓN] Operacion 0 (buscar) → SP %s(@Operacion=0, @Cufe=%s)", c.spName, cufe)
 	c.log.Infof("    · BD [SIMULACIÓN] Operacion 1 (actualizar) → SP %s(@Operacion=1, @Radicado=<Op0>, @Cufe=%s, @nit=%s, @valor=%.2f, @FechaHoraOriginal='%s' (UTC-5), @Mandato=%s)",
-		nombreSP, cufe, orNULL(nit), valor, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
+		c.spName, cufe, orNULL(nit), valor, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
 
 	insertables := 0
 	for _, a := range adjuntos {
@@ -241,7 +241,7 @@ func (c *Client) simular(cufe, nit string, valor float64, fechaCol time.Time, ma
 		}
 		notas := notasParaAdjunto(a.Extension, bl)
 		c.log.Infof("    · BD [SIMULACIÓN] Operacion 2 (insertar) → SP %s(@Operacion=2, @Radicado=<Op0>, @Cufe=%s, @NombreAdjunto=%s, @Extension=%s, @NotasAdjunto=%s, @Adjunto=%d bytes)",
-			nombreSP, cufe, truncar(a.Nombre, maxNombreAdjunto), truncar(a.Extension, maxExtension), notasLog(notas), len(a.Contenido))
+			c.spName, cufe, truncar(a.Nombre, maxNombreAdjunto), truncar(a.Extension, maxExtension), notasLog(notas), len(a.Contenido))
 		insertables++
 	}
 

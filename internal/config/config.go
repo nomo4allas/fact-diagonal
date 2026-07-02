@@ -29,6 +29,7 @@ type Config struct {
 	DBPassword string // contraseña
 	DBNameDMS  string // base de datos con Man_RadicadoFacturas_Test (p.ej. DMSDiagonal)
 	DBNameAdj  string // base de datos con la tabla Adjuntos
+	SPName     string // nombre del Stored Procedure a invocar (por defecto Spd_IA_DocumentosElectronicos)
 }
 
 // DBEnabled indica si hay configuración suficiente para activar el Módulo 3.
@@ -64,6 +65,7 @@ func Load(path string) (*Config, error) {
 		DBPassword:     os.Getenv("DB_PASSWORD"), // sin TrimSpace: la contraseña puede tener espacios significativos
 		DBNameDMS:      strings.TrimSpace(os.Getenv("DB_NAME_DMS")),
 		DBNameAdj:      strings.TrimSpace(os.Getenv("DB_NAME_ADJ")),
+		SPName:         orDefault(os.Getenv("SP_NAME"), "Spd_IA_DocumentosElectronicos"),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -105,6 +107,14 @@ func parseBool(v string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// orDefault devuelve v sin espacios, o def si v viene vacío.
+func orDefault(v, def string) string {
+	if s := strings.TrimSpace(v); s != "" {
+		return s
+	}
+	return def
 }
 
 // parseInt interpreta un entero positivo; ante un valor vacío, no numérico o

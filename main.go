@@ -48,7 +48,11 @@ func main() {
 		os.Exit(1)
 	}
 	lg.Infof("Buzón objetivo: %s", cfg.Mailbox)
-	lg.Infof("Modo simulación: %t (solo lectura, no se modifica nada)", cfg.SimulationMode)
+	if cfg.SimulationMode {
+		lg.Infof("Modo simulación: true (solo lectura)")
+	} else {
+		lg.Infof("Modo escritura real: true")
+	}
 
 	// Contexto con timeout global. El Módulo 2 descarga adjuntos y puede
 	// invocar OCR/Gemini, por lo que damos un margen amplio.
@@ -151,6 +155,7 @@ func main() {
 			Password: cfg.DBPassword,
 			NameDMS:  cfg.DBNameDMS,
 			NameAdj:  cfg.DBNameAdj,
+			SPName:   cfg.SPName,
 		}
 		var err error
 		db, err = database.Open(ctx, dbCfg, lg, cfg.SimulationMode)

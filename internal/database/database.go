@@ -37,12 +37,14 @@ type Config struct {
 	Password string
 	NameDMS  string // base con Man_RadicadoFacturas_Test
 	NameAdj  string // base con la tabla Adjuntos
+	SPName   string // nombre del Stored Procedure a invocar
 }
 
 // Client mantiene la conexión a SQL Server y la política de simulación. Todas
-// las operaciones se realizan invocando el Stored Procedure del cliente.
+// las operaciones se realizan invocando el Stored Procedure configurado (spName).
 type Client struct {
 	db         *sql.DB
+	spName     string
 	log        Logger
 	simulation bool
 }
@@ -80,7 +82,7 @@ func Open(ctx context.Context, cfg Config, log Logger, simulation bool) (*Client
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
 
-	c := &Client{db: db, log: log, simulation: simulation}
+	c := &Client{db: db, spName: cfg.SPName, log: log, simulation: simulation}
 	if err := c.db.PingContext(ctx); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("no responde SQL Server: %w", err)
