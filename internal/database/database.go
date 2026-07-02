@@ -1,21 +1,15 @@
 // Package database implementa el Módulo 3: integración con SQL Server.
 //
-// Por cada factura extraída por el Módulo 2 busca su registro en
-// Man_RadicadoFacturas_Test usando el campo llave [Cufe/Cude] (cuyo nombre
-// lleva una barra diagonal y por eso SIEMPRE se escribe entre corchetes). Si lo
-// encuentra, actualiza los campos de recepción e inserta el PDF y el XML en la
-// tabla dbo.Adjuntos, todo dentro de una misma transacción.
-//
-// Como el radicado vive en una base (DMSDiagonal) y los adjuntos en otra
-// (Adjuntos), se usa una ÚNICA conexión y nombres calificados de tres partes
-// ([base].dbo.tabla). SQL Server resuelve la transacción cross-database dentro
-// de la misma instancia sin necesidad de MSDTC.
+// Toda la lógica de negocio (buscar por CUFE, actualizar el radicado e insertar
+// los adjuntos) la resuelve el Stored Procedure del cliente
+// Spd_IA_DocumentosElectronicos. Este paquete solo lo invoca con las tres
+// operaciones definidas (0=buscar, 1=actualizar, 2=insertar adjunto) y traduce
+// su @Resultado al desenlace que el pipeline usa para clasificar el correo.
 //
 // Reglas de seguridad:
-//   - NUNCA hace INSERT en Man_RadicadoFacturas_Test; solo UPDATE de registros
-//     existentes hallados por CUFE.
-//   - En SIMULATION_MODE solo ejecuta lecturas (la búsqueda por CUFE) y registra
-//     en el log los UPDATE/INSERT que haría, sin tocar la base.
+//   - Nuestro código NO ejecuta INSERT/UPDATE directos: todo pasa por el SP.
+//   - En SIMULATION_MODE no se llama al SP: solo se registran en el log los
+//     parámetros que se enviarían en cada operación.
 package database
 
 import (
@@ -45,12 +39,10 @@ type Config struct {
 	NameAdj  string // base con la tabla Adjuntos
 }
 
-// Client mantiene la conexión a SQL Server y la política de simulación. Usa una
-// sola conexión para poder ejecutar transacciones que abarcan ambas bases.
+// Client mantiene la conexión a SQL Server y la política de simulación. Todas
+// las operaciones se realizan invocando el Stored Procedure del cliente.
 type Client struct {
 	db         *sql.DB
-	nameDMS    string
-	nameAdj    string
 	log        Logger
 	simulation bool
 }
@@ -77,8 +69,8 @@ func (c Config) dsn(database string) string {
 	return u.String()
 }
 
-// Open abre la conexión (a la base DMS, desde la que se referencian ambas bases
-// por nombre calificado) y verifica la conectividad.
+// Open abre la conexión a la base DMS (donde vive el Stored Procedure) y verifica
+// la conectividad.
 func Open(ctx context.Context, cfg Config, log Logger, simulation bool) (*Client, error) {
 	db, err := sql.Open("sqlserver", cfg.dsn(cfg.NameDMS))
 	if err != nil {
@@ -88,7 +80,7 @@ func Open(ctx context.Context, cfg Config, log Logger, simulation bool) (*Client
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
 
-	c := &Client{db: db, nameDMS: cfg.NameDMS, nameAdj: cfg.NameAdj, log: log, simulation: simulation}
+	c := &Client{db: db, log: log, simulation: simulation}
 	if err := c.db.PingContext(ctx); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("no responde SQL Server: %w", err)

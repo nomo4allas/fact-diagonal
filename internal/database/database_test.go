@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -40,12 +39,12 @@ func TestDSNPuertoPorDefecto(t *testing.T) {
 	}
 }
 
-// TestPersistSinCUFE verifica el caso de borde de CUFE vacío: no se toca la BD
-// (dms/adj nil) y se reporta EstadoNoHallado (correo → Pendientes), sin ejecutar
-// consulta alguna. Sin CUFE no hay forma de ubicar el registro automático.
+// TestPersistSinCUFE verifica el caso de borde de CUFE vacío: sin CUFE no se
+// puede invocar la Operacion 0, así que no se llama al SP (db nil no debe usarse)
+// y se reporta EstadoNoHallado (correo → Pendientes).
 func TestPersistSinCUFE(t *testing.T) {
 	log := &capturaLog{}
-	c := &Client{log: log, simulation: true} // dms/adj nil: no deben usarse
+	c := &Client{log: log, simulation: true} // db nil: no debe usarse
 
 	res, err := c.PersistInvoice(context.Background(), invoice.Data{CUFE: "   "}, time.Now(), nil)
 	if err != nil {
@@ -59,82 +58,70 @@ func TestPersistSinCUFE(t *testing.T) {
 	}
 }
 
-// TestSetsUpdateRadicado verifica la regla: Mandato/Explicacion solo entran al
-// UPDATE cuando el valor extraído no viene vacío; si viene vacío (o solo
-// espacios) se omiten del SET para no pisar lo que ya haya en la BD.
-func TestSetsUpdateRadicado(t *testing.T) {
-	fecha := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
-
+// TestParseValor cubre el parseo de @valor desde el formato del XML UBL
+// ("119000.00") y el colombiano del texto nativo ("119.000,00").
+func TestParseValor(t *testing.T) {
 	casos := []struct {
-		nombre       string
-		data         invoice.Data
-		wantMandato  bool
-		wantExplicac bool
+		in   string
+		want float64
 	}{
-		{"ambos presentes", invoice.Data{Pedido: "001", Declarac: "IM123"}, true, true},
-		{"ambos vacíos", invoice.Data{}, false, false},
-		{"solo Pedido", invoice.Data{Pedido: "001"}, true, false},
-		{"solo DECLARAC", invoice.Data{Declarac: "IM123"}, false, true},
-		{"solo espacios", invoice.Data{Pedido: "   ", Declarac: "\t"}, false, false},
+		{"119000.00", 119000.00},
+		{"119.000,00", 119000.00},
+		{"1.234.567,89", 1234567.89},
+		{"1234567.89", 1234567.89},
+		{"$ 119.000,00", 119000.00},
+		{"1000", 1000},
+		{"", 0},
+		{"N/A", 0},
 	}
 	for _, k := range casos {
-		sets, args := setsUpdateRadicado(k.data, fecha, 42)
-		joined := strings.Join(sets, ", ")
-
-		// Los 4 campos de recepción van siempre.
-		for _, base := range []string{"ViaDeRecepcion", "FechaHoraOriginal", "Usuario", "Pc"} {
-			if !strings.Contains(joined, base) {
-				t.Errorf("%s: falta el campo de recepción %q en SET=%q", k.nombre, base, joined)
-			}
-		}
-		if got := strings.Contains(joined, "Mandato ="); got != k.wantMandato {
-			t.Errorf("%s: Mandato presente=%t, want %t (SET=%q)", k.nombre, got, k.wantMandato, joined)
-		}
-		if got := strings.Contains(joined, "Explicacion ="); got != k.wantExplicac {
-			t.Errorf("%s: Explicacion presente=%t, want %t (SET=%q)", k.nombre, got, k.wantExplicac, joined)
-		}
-		// El arg @iddoc debe existir siempre; @mandato/@explicacion solo si aplica.
-		if !tieneNamed(args, "iddoc") {
-			t.Errorf("%s: falta el arg @iddoc", k.nombre)
-		}
-		if got := tieneNamed(args, "mandato"); got != k.wantMandato {
-			t.Errorf("%s: arg @mandato presente=%t, want %t", k.nombre, got, k.wantMandato)
-		}
-		if got := tieneNamed(args, "explicacion"); got != k.wantExplicac {
-			t.Errorf("%s: arg @explicacion presente=%t, want %t", k.nombre, got, k.wantExplicac)
+		if got := parseValor(k.in); got != k.want {
+			t.Errorf("parseValor(%q) = %v, want %v", k.in, got, k.want)
 		}
 	}
 }
 
-// TestNotasAdjunto verifica la regla del BL en el INSERT de Adjuntos: valor si el
-// BL tiene contenido, nil (→ NULL) si viene vacío o solo espacios.
-func TestNotasAdjunto(t *testing.T) {
+// TestTruncar verifica el recorte por runas a los límites varchar del SP.
+func TestTruncar(t *testing.T) {
 	casos := []struct {
-		bl      string
-		wantSQL any
-		wantLog string
+		in   string
+		max  int
+		want string
 	}{
-		{"BL123", "BL123", "'BL123'"},
-		{"  BL456 ", "BL456", "'BL456'"},
-		{"", nil, "NULL"},
-		{"   ", nil, "NULL"},
+		{"001", maxMandato, "001"},
+		{"1234567", maxMandato, "123456"},
+		{"café", 3, "caf"},
+		{"", maxNotasAdjunto, ""},
 	}
 	for _, k := range casos {
-		if got := notasAdjuntoSQL(k.bl); got != k.wantSQL {
-			t.Errorf("notasAdjuntoSQL(%q) = %v, want %v", k.bl, got, k.wantSQL)
-		}
-		if got := notasAdjuntoLog(k.bl); got != k.wantLog {
-			t.Errorf("notasAdjuntoLog(%q) = %q, want %q", k.bl, got, k.wantLog)
+		if got := truncar(k.in, k.max); got != k.want {
+			t.Errorf("truncar(%q,%d) = %q, want %q", k.in, k.max, got, k.want)
 		}
 	}
 }
 
-// tieneNamed indica si entre los args hay un sql.Named con el nombre dado.
-func tieneNamed(args []any, name string) bool {
-	for _, a := range args {
-		if n, ok := a.(sql.NamedArg); ok && n.Name == name {
-			return true
+// TestNotasParaAdjunto verifica @NotasAdjunto: BL para el PDF (o NULL si vacío) y
+// siempre NULL para el XML.
+func TestNotasParaAdjunto(t *testing.T) {
+	deref := func(p *string) string {
+		if p == nil {
+			return "<nil>"
+		}
+		return *p
+	}
+	casos := []struct {
+		ext, bl, want string
+	}{
+		{"pdf", "BL123", "BL123"},
+		{"pdf", "  BL456 ", "BL456"},
+		{"pdf", "", "<nil>"},
+		{"pdf", "   ", "<nil>"},
+		{"PDF", "BL789", "BL789"},
+		{"xml", "BL123", "<nil>"},
+	}
+	for _, k := range casos {
+		if got := deref(notasParaAdjunto(k.ext, k.bl)); got != k.want {
+			t.Errorf("notasParaAdjunto(%q,%q) = %q, want %q", k.ext, k.bl, got, k.want)
 		}
 	}
-	return false
 }
