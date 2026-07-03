@@ -66,16 +66,18 @@ type Result struct {
 type Outcome int
 
 const (
-	// Procesados: procesamiento exitoso completo.
+	// Procesados: procesamiento exitoso completo → mover a /Procesados.
 	Procesados Outcome = iota
-	// Pendientes: CUFE no encontrado en BD, o 0 adjuntos insertados ("SP devuelve 0").
+	// Pendientes: CUFE no encontrado en BD, 0 adjuntos insertados ("SP devuelve 0"),
+	// PDF ilegible o correo sin adjunto de factura válido → /Pendientes.
 	Pendientes
-	// Errores: error técnico (PDF ilegible, fallo de conexión, etc.) o correo sin
-	// adjunto de factura válido.
-	Errores
+	// ErrorTecnico: fallo técnico (llamada al SP, descarga de adjuntos). El correo
+	// NO se mueve: queda donde estaba. Mejora 3: ya no existe la carpeta /Errores.
+	ErrorTecnico
 )
 
-// Folder devuelve el nombre de la subcarpeta de Inbox asociada al desenlace.
+// Folder devuelve el nombre de la subcarpeta de Inbox asociada al desenlace, o
+// "" para ErrorTecnico (que no implica movimiento: el correo queda donde estaba).
 func (o Outcome) Folder() string {
 	switch o {
 	case Procesados:
@@ -83,8 +85,29 @@ func (o Outcome) Folder() string {
 	case Pendientes:
 		return "Pendientes"
 	default:
-		return "Errores"
+		return ""
 	}
+}
+
+// ErrKind clasifica un fallo técnico para decidir cómo reaccionar (Mejora 1):
+// KindSP se notifica a soporte; KindM365 solo se registra en el log local
+// (no se puede notificar sin conexión a Graph).
+type ErrKind int
+
+const (
+	KindNone ErrKind = iota // sin fallo técnico
+	KindSP                  // fallo en la llamada al Stored Procedure → notificar
+	KindM365                // fallo de conexión a Graph/M365 → solo log local
+)
+
+// Report resume el desenlace del procesamiento de un correo para que el llamador
+// decida la carpeta destino y, ante un fallo técnico, si notifica a soporte.
+type Report struct {
+	Results []Result
+	Outcome Outcome
+	// ErrKind y Err solo son significativos cuando Outcome == ErrorTecnico.
+	ErrKind ErrKind
+	Err     error
 }
 
 // peor devuelve el desenlace de mayor severidad entre dos.
@@ -96,14 +119,20 @@ func peor(a, b Outcome) Outcome {
 }
 
 // ProcessMessage descarga los adjuntos del correo, extrae los datos de cada
-// factura, los registra en el log y (Módulo 3) los persiste. Devuelve los
-// resultados consolidados y el desenlace agregado del correo (Outcome), que el
-// llamador usa para decidir la carpeta destino.
-func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg graph.Message) ([]Result, Outcome, error) {
+// factura, los registra en el log y (Módulo 3) los persiste. Devuelve un Report
+// con los resultados consolidados, el desenlace agregado (Outcome) y, ante un
+// fallo técnico, su clasificación (ErrKind) y detalle (Err) para que el llamador
+// decida la carpeta destino y si notifica a soporte.
+func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg graph.Message) Report {
 	atts, err := p.graph.ListAttachments(ctx, mailbox, msg.ID)
 	if err != nil {
-		// Fallo técnico al descargar adjuntos → Errores.
-		return nil, Errores, fmt.Errorf("no se pudieron descargar los adjuntos: %w", err)
+		// Fallo al descargar adjuntos = fallo de conexión a Graph/M365 → solo log
+		// local, el correo queda donde estaba (Mejora 1, categoría M365).
+		return Report{
+			Outcome: ErrorTecnico,
+			ErrKind: KindM365,
+			Err:     fmt.Errorf("no se pudieron descargar los adjuntos: %w", err),
+		}
 	}
 
 	var bundles []attachment.Bundle
@@ -134,26 +163,33 @@ func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg grap
 	}
 
 	if len(bundles) == 0 {
-		// Correo sin adjunto de factura válido → Errores.
-		p.log.Infof("    · sin adjuntos procesables (ZIP/PDF) en este correo")
-		return nil, Errores, nil
+		// Correo sin adjunto de factura válido: no es un fallo técnico, pero no se
+		// pudo procesar → Pendientes (queda para revisión/reintento). Mejora 3: ya
+		// no existe /Errores.
+		p.log.Infof("    · sin adjuntos procesables (ZIP/PDF) en este correo → Pendientes")
+		return Report{Outcome: Pendientes}
 	}
 
 	var results []Result
 	outcome := Procesados
 	for _, b := range bundles {
-		res, o := p.processBundle(ctx, b, msg.ReceivedDateTime)
+		res, o, err := p.processBundle(ctx, b, msg.ReceivedDateTime)
 		results = append(results, res)
+		if err != nil {
+			// Fallo técnico del Módulo 3 (llamada al SP) → notificar y no mover.
+			return Report{Results: results, Outcome: ErrorTecnico, ErrKind: KindSP, Err: err}
+		}
 		outcome = peor(outcome, o)
 	}
-	return results, outcome, nil
+	return Report{Results: results, Outcome: outcome}
 }
 
 // processBundle extrae los datos de un bundle (un PDF y/o un XML), los logea y,
 // si la BD está activa, los persiste (Módulo 3). fechaCorreo es la fecha de
-// recepción del correo, usada para FechaHoraOriginal. Devuelve, además del
-// resultado, el desenlace (Outcome) para la clasificación de carpetas.
-func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fechaCorreo time.Time) (Result, Outcome) {
+// recepción del correo, usada para FechaHoraOriginal. Devuelve el resultado, el
+// desenlace (Outcome) para la clasificación de carpetas y, si hubo un fallo
+// técnico del SP, el error (con Outcome == ErrorTecnico) para notificar a soporte.
+func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fechaCorreo time.Time) (Result, Outcome, error) {
 	res := Result{Origin: b.Origin}
 
 	// 1) XML UBL: fuente autoritativa.
@@ -182,18 +218,19 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	p.logDiscrepancies(res)
 	p.logFinal(res.Final)
 
-	// Si no se pudo extraer ningún campo clave, tratamos el bundle como error
-	// técnico (PDF ilegible / sin datos aprovechables) → Errores. No se toca la BD.
+	// Si no se pudo extraer ningún campo clave (PDF ilegible / sin datos), no es un
+	// fallo técnico de conexión: no se puede hallar el CUFE → Pendientes (revisión/
+	// reintento). No se toca la BD. Mejora 3: ya no existe /Errores.
 	if res.Final.FilledCount() == 0 {
-		p.log.Errorf("    · sin datos aprovechables en el bundle %q (PDF ilegible/vacío) → Errores", b.Origin)
-		return res, Errores
+		p.log.Errorf("    · sin datos aprovechables en el bundle %q (PDF ilegible/vacío) → Pendientes", b.Origin)
+		return res, Pendientes, nil
 	}
 
 	// 4) Módulo 3: persistir en SQL Server (si está configurado).
 	if p.db == nil {
 		// Sin Módulo 3 no hay verificación en BD; con la extracción exitosa el
 		// correo se considera procesado.
-		return res, Procesados
+		return res, Procesados, nil
 	}
 
 	var adjuntos []database.Adjunto
@@ -205,11 +242,12 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	}
 	persist, err := p.db.PersistInvoice(ctx, res.Final, fechaCorreo, adjuntos)
 	if err != nil {
-		// Fallo técnico de BD (p.ej. conexión) → Errores.
+		// Fallo técnico en la llamada al SP → ErrorTecnico: el llamador notifica a
+		// soporte y deja el correo donde estaba (Mejora 1, categoría SP).
 		p.log.Errorf("    · BD: la persistencia falló: %v", err)
-		return res, Errores
+		return res, ErrorTecnico, err
 	}
-	return res, outcomeDeEstado(persist.Estado)
+	return res, outcomeDeEstado(persist.Estado), nil
 }
 
 // outcomeDeEstado traduce el desenlace de la BD (Módulo 3) a la carpeta destino.

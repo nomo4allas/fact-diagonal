@@ -21,6 +21,7 @@ type Config struct {
 	GeminiAPIKey   string // Clave de Gemini API (opcional, último eslabón de la cascada)
 	FilterFrom     string // Opcional: si no está vacío, solo procesa correos cuyo remitente lo contenga (subcadena, case-insensitive)
 	MaxCorreos     int    // Máximo de correos a procesar por corrida (por defecto 5 si no se define)
+	SMTPTo         string // Destinatario de las notificaciones de error (p.ej. soporte@diagonal.com.co). El remitente es Mailbox.
 
 	// Módulo 3 — SQL Server. Opcionales: si DBServer está vacío, el módulo se omite.
 	DBServer   string // host del servidor SQL Server
@@ -59,6 +60,7 @@ func Load(path string) (*Config, error) {
 		GeminiAPIKey:   strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
 		FilterFrom:     strings.TrimSpace(os.Getenv("FILTER_FROM")),
 		MaxCorreos:     parseInt(os.Getenv("MAX_CORREOS"), 5),
+		SMTPTo:         strings.TrimSpace(os.Getenv("SMTP_TO")),
 		DBServer:       strings.TrimSpace(os.Getenv("DB_SERVER")),
 		DBPort:         strings.TrimSpace(os.Getenv("DB_PORT")),
 		DBUser:         strings.TrimSpace(os.Getenv("DB_USER")),

@@ -97,6 +97,34 @@ func (c *Client) ListUnreadMessages(ctx context.Context, mailbox string) ([]Mess
 	return all, nil
 }
 
+// ListChildFolderMessages devuelve los mensajes de una subcarpeta de correo
+// (identificada por su folderID), siguiendo la paginación de Graph. Se usa para
+// releer /Pendientes en cada corrida. Es solo lectura: no marca ni mueve nada.
+//
+// No aplica filtro de servidor sobre hasAttachments (para evitar el
+// "InefficientFilter" que Graph devuelve al combinar filtro+orderby); el llamador
+// filtra los que traen adjuntos del lado del cliente, igual que con la bandeja.
+func (c *Client) ListChildFolderMessages(ctx context.Context, mailbox, folderID string) ([]Message, error) {
+	q := url.Values{}
+	q.Set("$select", "id,subject,from,receivedDateTime,hasAttachments,isRead")
+	q.Set("$orderby", "receivedDateTime DESC")
+	q.Set("$top", "50")
+
+	next := fmt.Sprintf("%s/users/%s/mailFolders/%s/messages?%s",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(folderID), q.Encode())
+
+	var all []Message
+	for next != "" {
+		page, err := c.fetchPage(ctx, next)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Value...)
+		next = page.NextLink
+	}
+	return all, nil
+}
+
 // fetchPage ejecuta una petición GET y decodifica una página de resultados.
 func (c *Client) fetchPage(ctx context.Context, rawURL string) (*messagesResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -195,7 +223,7 @@ func (c *Client) ListAttachments(ctx context.Context, mailbox, messageID string)
 // ---------------------------------------------------------------------------
 // Manejo de carpetas del buzón (ajuste "lógica de carpetas").
 //
-// Las carpetas destino (Procesados/Pendientes/Errores) son SUBCARPETAS de Inbox.
+// Las carpetas destino (Procesados/Pendientes) son SUBCARPETAS de Inbox.
 // ResolveInboxChildFolder las localiza por displayName y las crea si no existen;
 // MoveMessage mueve un correo a una carpeta. Ambas operaciones ESCRIBEN en el
 // buzón, por lo que el llamador debe respetar SIMULATION_MODE (no invocarlas en
@@ -211,6 +239,13 @@ type mailFolder struct {
 type mailFoldersResponse struct {
 	Value    []mailFolder `json:"value"`
 	NextLink string       `json:"@odata.nextLink"`
+}
+
+// FindInboxChildFolder localiza (solo lectura, sin crear) una subcarpeta de
+// Inbox por displayName. Devuelve su ID y found=true si existe. Se usa para
+// releer /Pendientes sin crearla: en SIMULATION_MODE no se debe crear nada.
+func (c *Client) FindInboxChildFolder(ctx context.Context, mailbox, displayName string) (id string, found bool, err error) {
+	return c.findInboxChildFolder(ctx, mailbox, displayName)
 }
 
 // ResolveInboxChildFolder devuelve el ID de la subcarpeta de Inbox con el
@@ -285,6 +320,33 @@ func (c *Client) MoveMessage(ctx context.Context, mailbox, messageID, destFolder
 	}
 	if _, err := c.doJSON(ctx, http.MethodPost, rawURL, payload, http.StatusCreated, http.StatusOK); err != nil {
 		return fmt.Errorf("error moviendo el correo a la carpeta destino: %w", err)
+	}
+	return nil
+}
+
+// SendMail envía un correo de texto plano desde el buzón `from` al destinatario
+// `to` usando el endpoint sendMail de Graph. Graph responde 202 Accepted. ESCRIBE
+// (envía) desde el buzón, por lo que el llamador debe respetar SIMULATION_MODE.
+func (c *Client) SendMail(ctx context.Context, from, to, subject, body string) error {
+	rawURL := fmt.Sprintf("%s/users/%s/sendMail", baseURL, url.PathEscape(from))
+	payload, err := json.Marshal(map[string]any{
+		"message": map[string]any{
+			"subject": subject,
+			"body": map[string]string{
+				"contentType": "Text",
+				"content":     body,
+			},
+			"toRecipients": []map[string]any{
+				{"emailAddress": map[string]string{"address": to}},
+			},
+		},
+		"saveToSentItems": true,
+	})
+	if err != nil {
+		return fmt.Errorf("error serializando el correo de notificación: %w", err)
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, rawURL, payload, http.StatusAccepted, http.StatusOK); err != nil {
+		return fmt.Errorf("error enviando el correo de notificación: %w", err)
 	}
 	return nil
 }
