@@ -9,6 +9,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -29,12 +30,25 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
+// attachmentLister es el subconjunto de *graph.Client que usa el pipeline para
+// leer los adjuntos de un correo. Se declara como interfaz para poder inyectar
+// un doble en las pruebas sin depender de Microsoft Graph.
+type attachmentLister interface {
+	ListAttachments(ctx context.Context, mailbox, messageID string) ([]graph.Attachment, error)
+}
+
+// invoicePersister es el subconjunto de *database.Client que usa el pipeline
+// (Módulo 3). Interfaz para poder inyectar un doble en las pruebas sin SQL Server.
+type invoicePersister interface {
+	PersistInvoice(ctx context.Context, data invoice.Data, fechaCorreo time.Time, adjuntos []database.Adjunto) (database.Persistencia, error)
+}
+
 // Processor agrupa las dependencias para procesar los adjuntos de un correo.
 type Processor struct {
-	graph      *graph.Client
+	graph      attachmentLister
 	ocr        *ocr.Engine
 	gemini     *gemini.Client
-	db         *database.Client // Módulo 3; nil si la BD no está configurada
+	db         invoicePersister // Módulo 3; nil si la BD no está configurada
 	log        Logger
 	simulation bool
 }
@@ -42,14 +56,20 @@ type Processor struct {
 // New construye el Processor de los Módulos 2 y 3. db puede ser nil para
 // desactivar la integración con SQL Server.
 func New(gc *graph.Client, gem *gemini.Client, db *database.Client, log Logger, simulation bool) *Processor {
-	return &Processor{
+	p := &Processor{
 		graph:      gc,
 		ocr:        ocr.New(),
 		gemini:     gem,
-		db:         db,
 		log:        log,
 		simulation: simulation,
 	}
+	// Solo asignamos db si no es nil: guardar un *database.Client nil en la interfaz
+	// produciría un valor-nil tipado (interfaz != nil), rompiendo la comprobación
+	// `p.db == nil` que decide si el Módulo 3 está activo.
+	if db != nil {
+		p.db = db
+	}
+	return p
 }
 
 // Result reúne lo extraído de un bundle: los datos por fuente y el consolidado.
@@ -66,13 +86,17 @@ type Result struct {
 type Outcome int
 
 const (
-	// Procesados: procesamiento exitoso completo → mover a /Procesados.
+	// Procesados: extracción OK + BD OK (factura persistida) → /Procesados.
 	Procesados Outcome = iota
-	// Pendientes: CUFE no encontrado en BD, 0 adjuntos insertados ("SP devuelve 0"),
-	// PDF ilegible o correo sin adjunto de factura válido → /Pendientes.
+	// Pendientes: extracción OK pero el CUFE no se encontró en la BD (o el SP no
+	// insertó adjuntos) → /Pendientes, para reintento cuando la factura exista.
 	Pendientes
-	// ErrorTecnico: fallo técnico (llamada al SP, descarga de adjuntos). El correo
-	// NO se mueve: queda donde estaba. Mejora 3: ya no existe la carpeta /Errores.
+	// Errores: la extracción falló por causa del agente (PDF corrupto/ilegible, ZIP
+	// mal formado, adjunto vacío, formato no reconocido, o la cascada no obtuvo
+	// datos y no había XML) → /Errores, con notificación a soporte.
+	Errores
+	// ErrorTecnico: fallo técnico externo (llamada al SP, descarga de adjuntos). El
+	// correo NO se mueve: queda donde estaba (bandeja de entrada).
 	ErrorTecnico
 )
 
@@ -84,6 +108,8 @@ func (o Outcome) Folder() string {
 		return "Procesados"
 	case Pendientes:
 		return "Pendientes"
+	case Errores:
+		return "Errores"
 	default:
 		return ""
 	}
@@ -163,23 +189,33 @@ func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg grap
 	}
 
 	if len(bundles) == 0 {
-		// Correo sin adjunto de factura válido: no es un fallo técnico, pero no se
-		// pudo procesar → Pendientes (queda para revisión/reintento). Mejora 3: ya
-		// no existe /Errores.
-		p.log.Infof("    · sin adjuntos procesables (ZIP/PDF) en este correo → Pendientes")
-		return Report{Outcome: Pendientes}
+		// Correo sin adjunto de factura válido por causa del agente (formato no
+		// reconocido, adjunto vacío o ZIP mal formado que no dejó documentos) →
+		// Errores: se mueve a /Errores y se notifica a soporte.
+		p.log.Errorf("    · sin adjuntos procesables (ZIP/PDF) en este correo → Errores")
+		return Report{Outcome: Errores, Err: errors.New("el correo no contiene adjuntos procesables (formato no reconocido, adjunto vacío o ZIP mal formado)")}
 	}
 
 	var results []Result
 	outcome := Procesados
+	var erroresErr error // primer detalle de fallo de extracción, para notificar
 	for _, b := range bundles {
 		res, o, err := p.processBundle(ctx, b, msg.ReceivedDateTime)
 		results = append(results, res)
-		if err != nil {
+		switch o {
+		case ErrorTecnico:
 			// Fallo técnico del Módulo 3 (llamada al SP) → notificar y no mover.
 			return Report{Results: results, Outcome: ErrorTecnico, ErrKind: KindSP, Err: err}
+		case Errores:
+			// Fallo de extracción por causa del agente; conservamos el primer detalle.
+			if erroresErr == nil {
+				erroresErr = err
+			}
 		}
 		outcome = peor(outcome, o)
+	}
+	if outcome == Errores {
+		return Report{Results: results, Outcome: Errores, Err: erroresErr}
 	}
 	return Report{Results: results, Outcome: outcome}
 }
@@ -218,12 +254,13 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	p.logDiscrepancies(res)
 	p.logFinal(res.Final)
 
-	// Si no se pudo extraer ningún campo clave (PDF ilegible / sin datos), no es un
-	// fallo técnico de conexión: no se puede hallar el CUFE → Pendientes (revisión/
-	// reintento). No se toca la BD. Mejora 3: ya no existe /Errores.
+	// Si no se pudo extraer ningún campo clave, la extracción falló por causa del
+	// agente: PDF corrupto/ilegible, adjunto vacío, o la cascada (incluida Gemini)
+	// no obtuvo datos y no había XML. → Errores (mover a /Errores + notificar). No
+	// se toca la BD.
 	if res.Final.FilledCount() == 0 {
-		p.log.Errorf("    · sin datos aprovechables en el bundle %q (PDF ilegible/vacío) → Pendientes", b.Origin)
-		return res, Pendientes, nil
+		p.log.Errorf("    · sin datos aprovechables en el bundle %q (PDF ilegible/vacío o extracción fallida) → Errores", b.Origin)
+		return res, Errores, fmt.Errorf("no se pudieron extraer datos del adjunto %q (PDF ilegible/vacío o extracción fallida sin XML de respaldo)", b.Origin)
 	}
 
 	// 4) Módulo 3: persistir en SQL Server (si está configurado).

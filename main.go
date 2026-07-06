@@ -12,10 +12,16 @@
 // los campos de recepción e inserta el PDF y el XML en la tabla Adjuntos.
 //
 // En cada corrida procesa (Mejora 2): (1) los correos no leídos de la bandeja de
-// entrada y (2) los correos de la carpeta /Pendientes. Un correo procesado con
-// éxito va a /Procesados; si sigue sin CUFE, queda en /Pendientes; ante un fallo
-// técnico se notifica a soporte (Mejora 1) y el correo queda donde estaba
-// (Mejora 3: ya no existe la carpeta /Errores).
+// entrada y (2) los correos de la carpeta /Pendientes. Lógica de carpetas:
+//   - /Procesados: extracción OK + BD OK.
+//   - /Pendientes: extracción OK + CUFE no encontrado en la BD.
+//   - /Errores:    la extracción falló por causa del agente (PDF corrupto/ilegible,
+//     ZIP mal formado, adjunto vacío, formato no reconocido, o la
+//     cascada no obtuvo datos y no había XML) → se notifica a soporte.
+//
+// Un fallo técnico externo se maneja aparte: error de BD/SP deja el correo en la
+// bandeja de entrada y notifica a soporte (Mejora 1); un error de conexión a M365
+// solo se registra en el log local. Al final se escribe un resumen de la corrida.
 //
 // Respeta SIMULATION_MODE: en simulación solo lee/registra lo que haría, sin
 // enviar correos de notificación, sin mover mensajes y sin escribir en la BD.
@@ -41,8 +47,9 @@ import (
 
 // Tipos de error para las notificaciones a soporte (Mejora 1).
 const (
-	tipoErrorSQL = "Conexión SQL Server"
-	tipoErrorSP  = "Llamada al SP"
+	tipoErrorSQL        = "Conexión SQL Server"
+	tipoErrorSP         = "Llamada al SP"
+	tipoErrorExtraccion = "Extracción de adjunto"
 )
 
 // workItem es un correo a procesar junto con la carpeta de la que proviene
@@ -50,6 +57,29 @@ const (
 type workItem struct {
 	msg    graph.Message
 	source string
+}
+
+// resumen agrupa los contadores de una corrida para el bloque de resumen final.
+type resumen struct {
+	procesados  int // correos con desenlace Procesados
+	pendientes  int // correos con desenlace Pendientes
+	conError    int // correos con desenlace Errores (fallo de extracción)
+	erroresBD   int // correos detenidos por fallo de BD/SP
+	erroresM365 int // correos detenidos por fallo de conexión a M365
+}
+
+// logResumen escribe el bloque "=== RESUMEN DE CORRIDA ===" en el log (Ajuste 2).
+func logResumen(lg *logger.Logger, inicio, fin time.Time, r resumen) {
+	lg.Infof("=== RESUMEN DE CORRIDA ===")
+	lg.Infof("Fecha/hora inicio:    %s", inicio.Local().Format("2006-01-02 15:04:05"))
+	lg.Infof("Fecha/hora fin:       %s", fin.Local().Format("2006-01-02 15:04:05"))
+	lg.Infof("Correos procesados:   %d", r.procesados)
+	lg.Infof("Correos pendientes:   %d", r.pendientes)
+	lg.Infof("Correos con error:    %d", r.conError)
+	lg.Infof("Errores de BD/SP:     %d", r.erroresBD)
+	lg.Infof("Errores de M365:      %d", r.erroresM365)
+	lg.Infof("Tiempo total:         %s", fin.Sub(inicio).Round(time.Second))
+	lg.Infof("==========================")
 }
 
 func main() {
@@ -62,6 +92,9 @@ func main() {
 	defer lg.Close()
 
 	lg.Infof("=== fact-diagonal · Módulos 1, 2 y 3 (buzón + extracción + SQL Server) ===")
+
+	// Marca de inicio para el resumen de corrida (Ajuste 2).
+	inicio := time.Now()
 
 	// 1) Cargar y validar configuración.
 	cfg, err := config.Load("config.env")
@@ -198,6 +231,7 @@ func main() {
 
 	if len(work) == 0 {
 		lg.Infof("No hay correos que procesar (bandeja de entrada ni /Pendientes).")
+		logResumen(lg, inicio, time.Now(), resumen{})
 		return
 	}
 
@@ -241,13 +275,13 @@ func main() {
 	gem := gemini.New(cfg.GeminiAPIKey)
 	proc := pipeline.New(gc, gem, db, lg, cfg.SimulationMode)
 
-	// Resolvemos (creándolas si faltan) las carpetas destino /Procesados y
-	// /Pendientes. Solo fuera de simulación: en SIMULATION_MODE no se crea ni se
-	// mueve nada, solo se registra el destino en el log. Mejora 3: sin /Errores.
+	// Resolvemos (creándolas si faltan) las carpetas destino /Procesados,
+	// /Pendientes y /Errores. Solo fuera de simulación: en SIMULATION_MODE no se
+	// crea ni se mueve nada, solo se registra el destino en el log.
 	var carpetas map[string]string // nombre → folderID
 	if !cfg.SimulationMode {
-		carpetas = make(map[string]string, 2)
-		for _, name := range []string{"Procesados", "Pendientes"} {
+		carpetas = make(map[string]string, 3)
+		for _, name := range []string{"Procesados", "Pendientes", "Errores"} {
 			id, err := gc.ResolveInboxChildFolder(ctx, cfg.Mailbox, name)
 			if err != nil {
 				lg.Errorf("no se pudo resolver/crear la carpeta /%s: %v", name, err)
@@ -258,7 +292,9 @@ func main() {
 		}
 	}
 
-	procesadas := 0
+	// Contadores para el resumen de corrida (Ajuste 2).
+	procesadas := 0 // facturas (bundles) procesadas
+	var res resumen
 	for i, it := range work {
 		m := it.msg
 		subject := m.Subject
@@ -271,23 +307,41 @@ func main() {
 		rep := proc.ProcessMessage(ctx, cfg.Mailbox, m)
 		procesadas += len(rep.Results)
 
-		// Fallo técnico: el correo NO se mueve, queda donde estaba (Mejora 3).
+		// Fallo técnico externo (BD/SP o M365): el correo NO se mueve, queda donde
+		// estaba (bandeja de entrada).
 		if rep.Outcome == pipeline.ErrorTecnico {
 			switch rep.ErrKind {
 			case pipeline.KindSP:
 				// Fallo en la llamada al SP → notificar a soporte (Mejora 1).
+				res.erroresBD++
 				lg.Errorf("    error técnico en el SP: %v", rep.Err)
 				notifier.Notify(ctx, tipoErrorSP, rep.Err.Error())
 			default:
 				// Fallo de conexión a M365 → solo log local (no se puede notificar).
+				res.erroresM365++
 				lg.Errorf("    error de conexión M365: %v (solo log local)", rep.Err)
 			}
 			lg.Infof("    el correo queda en /%s sin mover.", it.source)
 			continue
 		}
 
+		// Fallo de extracción por causa del agente (PDF corrupto/ilegible, ZIP mal
+		// formado, adjunto vacío, formato no reconocido, o cascada sin datos y sin
+		// XML): se notifica a soporte y el correo se mueve a /Errores.
+		if rep.Outcome == pipeline.Errores {
+			res.conError++
+			lg.Errorf("    error de extracción: %v", rep.Err)
+			notifier.Notify(ctx, tipoErrorExtraccion+" · "+subject, rep.Err.Error())
+		}
+
 		// Desenlace normal: destino según el Outcome.
-		destino := rep.Outcome.Folder() // "Procesados" | "Pendientes"
+		destino := rep.Outcome.Folder() // "Procesados" | "Pendientes" | "Errores"
+		switch rep.Outcome {
+		case pipeline.Procesados:
+			res.procesados++
+		case pipeline.Pendientes:
+			res.pendientes++
+		}
 
 		// Si ya está en la carpeta destino (p.ej. /Pendientes sigue Pendientes),
 		// no hay nada que mover.
@@ -321,4 +375,7 @@ func main() {
 	} else {
 		lg.Infof("Proceso finalizado.")
 	}
+
+	// Resumen de corrida (Ajuste 2): bloque legible al final del log.
+	logResumen(lg, inicio, time.Now(), res)
 }
