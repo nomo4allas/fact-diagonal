@@ -33,6 +33,7 @@ import (
 	"github.com/nomo4allas/fact-diagonal/internal/database"
 	"github.com/nomo4allas/fact-diagonal/internal/extract/gemini"
 	"github.com/nomo4allas/fact-diagonal/internal/graph"
+	"github.com/nomo4allas/fact-diagonal/internal/license"
 	"github.com/nomo4allas/fact-diagonal/internal/logger"
 	"github.com/nomo4allas/fact-diagonal/internal/notify"
 	"github.com/nomo4allas/fact-diagonal/internal/pipeline"
@@ -68,6 +69,15 @@ func main() {
 		lg.Errorf("configuración inválida: %v", err)
 		os.Exit(1)
 	}
+	// 1.1) Validación de licencia (Nivel 1 + Nivel 2). Es el primer paso operativo:
+	// se ejecuta antes de autenticar, leer el buzón o tocar la BD. Si falla, no se
+	// revela cuál nivel falló ni se intenta notificar por correo: solo se registra
+	// el mensaje acordado y se detiene el agente.
+	if err := license.Validate(cfg); err != nil {
+		lg.Errorf("Licencia inválida - agente detenido")
+		os.Exit(1)
+	}
+
 	lg.Infof("Buzón objetivo: %s", cfg.Mailbox)
 	if cfg.SimulationMode {
 		lg.Infof("Modo simulación: true (solo lectura; no envía, no mueve, no escribe)")
