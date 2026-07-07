@@ -188,15 +188,19 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 // @Resultado.
 //
 // Reparto de parámetros por operación:
-//   - @Cufe, @FechaHoraOriginal y @Mandato: aplican a la búsqueda (0) y la
+//   - @Cufe: aplica a las tres operaciones. En la inserción de adjunto (2) el SP
+//     lo usa para validar que el registro exista antes de insertar.
+//   - @FechaHoraOriginal y @Mandato: aplican a la búsqueda (0) y la
 //     actualización (1); NULL en la inserción de adjunto (2).
 //   - @NotasAdjunto, @NombreAdjunto, @Extension y @Adjunto: solo aplican a la
 //     inserción de adjunto (2); NULL en las demás operaciones.
 func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje string, err error) {
-	// Campos de factura: NULL en la Operacion 2 (insertar adjunto).
-	var cufe, fechaHora, mandato any // nil → NULL
+	// @Cufe viaja en las tres operaciones (el SP lo valida también en la Op 2).
+	cufe := any(p.Cufe)
+
+	// @FechaHoraOriginal y @Mandato: NULL en la Operacion 2 (insertar adjunto).
+	var fechaHora, mandato any // nil → NULL
 	if p.Operacion != opInsertarAdjunto {
-		cufe = p.Cufe
 		fechaHora = p.FechaHoraOriginal
 		mandato = p.Mandato
 	}
