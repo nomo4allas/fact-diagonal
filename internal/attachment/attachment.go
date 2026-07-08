@@ -4,6 +4,8 @@
 //
 // Soporta dos formas de entrega habituales en facturación electrónica DIAN:
 //   - Adjunto ZIP que contiene el PDF de representación gráfica y el XML UBL.
+//     El ZIP puede anidar otros ZIP; se descomprimen de forma recursiva hasta
+//     dar con los PDF/XML (ver maxZIPDepth).
 //   - Adjunto PDF directo (sin XML de respaldo).
 package attachment
 
@@ -53,39 +55,26 @@ func IsRelevant(name, contentType string) bool {
 	return IsZIP(name, contentType) || IsPDF(name, contentType)
 }
 
+// maxZIPDepth limita cuántos niveles de ZIP anidados se descomprimen. Es un
+// tope de seguridad para evitar bucles o "ZIP bombs": el ZIP de entrada es el
+// nivel 1 y cada ZIP interior suma uno.
+const maxZIPDepth = 5
+
+// doc es un PDF o XML ya extraído, identificado por su nombre dentro del ZIP.
+type doc struct {
+	name string
+	data []byte
+}
+
 // FromZIP descomprime el ZIP y devuelve un bundle por cada PDF encontrado,
 // emparejándolo con el XML del mismo nombre base si existe; un XML suelto sin
 // PDF también genera su propio bundle. Esto cubre el caso típico (un PDF + un
-// XML) y los menos comunes (varios documentos en un mismo ZIP).
+// XML) y los menos comunes (varios documentos en un mismo ZIP). Los ZIP
+// anidados se recorren de forma recursiva hasta maxZIPDepth niveles.
 func FromZIP(origin string, data []byte) ([]Bundle, error) {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return nil, fmt.Errorf("no se pudo abrir el ZIP %q: %w", origin, err)
-	}
-
-	type doc struct {
-		name string
-		data []byte
-	}
 	var pdfs, xmls []doc
-
-	for _, f := range zr.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
-		ext := strings.ToLower(filepath.Ext(f.Name))
-		if ext != ".pdf" && ext != ".xml" {
-			continue
-		}
-		content, err := readZipFile(f)
-		if err != nil {
-			return nil, fmt.Errorf("error leyendo %q dentro de %q: %w", f.Name, origin, err)
-		}
-		if ext == ".pdf" {
-			pdfs = append(pdfs, doc{f.Name, content})
-		} else {
-			xmls = append(xmls, doc{f.Name, content})
-		}
+	if err := collectDocs(origin, data, 1, &pdfs, &xmls); err != nil {
+		return nil, err
 	}
 
 	// Indexamos los XML por nombre base para emparejarlos con su PDF.
@@ -126,6 +115,43 @@ func FromZIP(origin string, data []byte) ([]Bundle, error) {
 // FromPDF crea un bundle con un PDF directo (sin XML de respaldo).
 func FromPDF(name string, data []byte) Bundle {
 	return Bundle{Origin: name, PDF: data, PDFName: name}
+}
+
+// collectDocs recorre las entradas de un ZIP acumulando los PDF y XML en los
+// slices recibidos. Si encuentra un ZIP anidado desciende recursivamente
+// (depth+1) hasta maxZIPDepth para no caer en bucles ni ZIP bombs.
+func collectDocs(origin string, data []byte, depth int, pdfs, xmls *[]doc) error {
+	if depth > maxZIPDepth {
+		return fmt.Errorf("ZIP %q excede el máximo de %d niveles de anidamiento", origin, maxZIPDepth)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("no se pudo abrir el ZIP %q: %w", origin, err)
+	}
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f.Name))
+		if ext != ".pdf" && ext != ".xml" && ext != ".zip" {
+			continue
+		}
+		content, err := readZipFile(f)
+		if err != nil {
+			return fmt.Errorf("error leyendo %q dentro de %q: %w", f.Name, origin, err)
+		}
+		switch ext {
+		case ".pdf":
+			*pdfs = append(*pdfs, doc{f.Name, content})
+		case ".xml":
+			*xmls = append(*xmls, doc{f.Name, content})
+		case ".zip":
+			if err := collectDocs(f.Name, content, depth+1, pdfs, xmls); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // readZipFile abre y lee por completo una entrada del ZIP.
