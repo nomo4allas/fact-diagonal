@@ -77,8 +77,8 @@ func TestTruncar(t *testing.T) {
 	}
 }
 
-// TestNotasParaAdjunto verifica @NotasAdjunto: BL para el PDF (o NULL si vacío) y
-// siempre NULL para el XML.
+// TestNotasParaAdjunto verifica @NotasAdjunto: el número de documento (recortado)
+// para cualquier adjunto, o NULL cuando no está disponible.
 func TestNotasParaAdjunto(t *testing.T) {
 	deref := func(p *string) string {
 		if p == nil {
@@ -87,18 +87,16 @@ func TestNotasParaAdjunto(t *testing.T) {
 		return *p
 	}
 	casos := []struct {
-		ext, bl, want string
+		numDocumento, want string
 	}{
-		{"pdf", "BL123", "BL123"},
-		{"pdf", "  BL456 ", "BL456"},
-		{"pdf", "", "<nil>"},
-		{"pdf", "   ", "<nil>"},
-		{"PDF", "BL789", "BL789"},
-		{"xml", "BL123", "<nil>"},
+		{"FE470", "FE470"},
+		{"  FE471 ", "FE471"},
+		{"", "<nil>"},
+		{"   ", "<nil>"},
 	}
 	for _, k := range casos {
-		if got := deref(notasParaAdjunto(k.ext, k.bl)); got != k.want {
-			t.Errorf("notasParaAdjunto(%q,%q) = %q, want %q", k.ext, k.bl, got, k.want)
+		if got := deref(notasParaAdjunto(k.numDocumento)); got != k.want {
+			t.Errorf("notasParaAdjunto(%q) = %q, want %q", k.numDocumento, got, k.want)
 		}
 	}
 }

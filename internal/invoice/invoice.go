@@ -36,7 +36,8 @@ type Data struct {
 	// considera "completa", pero se persisten en el Módulo 3:
 	//   - Pedido    → Man_RadicadoFacturas_Test.Mandato
 	//   - Declarac  → Man_RadicadoFacturas_Test.Explicacion
-	//   - BL        → Adjuntos.NotasAdjunto
+	//
+	// @NotasAdjunto de los adjuntos usa el número de documento (Numero), no el BL.
 	Pedido   string // "PEDIDO No:" del PDF
 	Declarac string // "DECLARAC:" del PDF
 	BL       string // Bill of Lading: "DOCTTE:" o "N° BL:" del PDF

@@ -52,10 +52,11 @@ type Persistencia struct {
 	Adjuntos int // número de adjuntos efectivamente insertados (@Resultado>0)
 }
 
-// Adjunto representa un archivo a insertar vía la Operacion 2 del SP.
+// Adjunto representa un archivo a insertar vía la Operacion 2 del SP. Puede ser
+// cualquier archivo del ZIP: PDF, XML, JPG, TIF, DOCX, etc.
 type Adjunto struct {
-	Nombre    string // @NombreAdjunto
-	Extension string // @Extension: "pdf" | "xml"
+	Nombre    string // @NombreAdjunto: nombre exacto del archivo
+	Extension string // @Extension: extensión sin punto ("pdf", "xml", "jpg"…)
 	Contenido []byte // @Adjunto (varbinary)
 }
 
@@ -93,8 +94,12 @@ type spParams struct {
 //     @Resultado>0 → es el radicado; se continúa.
 //  2. Operacion 1 (actualizar). Si devuelve 0 se registra advertencia pero se
 //     sigue con los adjuntos.
-//  3. Operacion 2 (insertar adjunto) por cada adjunto (PDF y XML). Si alguno
+//  3. Operacion 2 (insertar adjunto) por cada archivo del ZIP (PDF, XML, JPG,
+//     TIF, DOCX…), todos con @NotasAdjunto = número de documento. Si alguno
 //     devuelve 0 → EstadoPendiente. Todos OK → EstadoProcesado.
+//
+// Las Operaciones 1 y 2 solo se ejecutan si la Operacion 0 halló el CUFE
+// (Radicado > 0); en caso contrario → EstadoNoHallado (Pendientes).
 //
 // Un error técnico al invocar el SP se propaga (el pipeline lo clasifica como
 // Errores). En SIMULATION_MODE no se llama al SP: solo se loguean los parámetros.
@@ -109,7 +114,7 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 	mandato := truncar(strings.TrimSpace(data.Pedido), maxMandato)
 
 	if c.simulation {
-		return c.simular(cufe, fechaCol, mandato, data.BL, adjuntos), nil
+		return c.simular(cufe, fechaCol, mandato, data.Numero, adjuntos), nil
 	}
 
 	// 1) Operacion 0 — buscar por CUFE.
@@ -146,7 +151,9 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 		c.log.Infof("    · BD: Operacion 1 (actualizar Radicado=%d) OK → Resultado=%d", radicado, res1)
 	}
 
-	// 3) Operacion 2 — insertar adjuntos (PDF y XML).
+	// 3) Operacion 2 — insertar todos los adjuntos del ZIP (PDF, XML y demás).
+	// @NotasAdjunto lleva el número de documento de la factura para todos.
+	notas := notasParaAdjunto(data.Numero)
 	insertados, todosOK := 0, true
 	for _, a := range adjuntos {
 		if len(a.Contenido) == 0 {
@@ -161,7 +168,7 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 			NombreAdjunto: truncar(a.Nombre, maxNombreAdjunto),
 			Extension:     truncar(a.Extension, maxExtension),
 			Adjunto:       a.Contenido,
-			NotasAdjunto:  notasParaAdjunto(a.Extension, data.BL),
+			NotasAdjunto:  notas,
 		})
 		if err != nil {
 			c.log.Errorf("    · BD: Operacion 2 (insertar %s %q) falló: %v", a.Extension, a.Nombre, err)
@@ -241,18 +248,18 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 // ejecutarlo. Como no se llama a la Operacion 0, no hay radicado real: se usa el
 // marcador 0 y se asume el desenlace que tendría un flujo exitoso, para que la
 // clasificación de carpetas en simulación sea representativa.
-func (c *Client) simular(cufe string, fechaCol time.Time, mandato, bl string, adjuntos []Adjunto) Persistencia {
+func (c *Client) simular(cufe string, fechaCol time.Time, mandato, numDocumento string, adjuntos []Adjunto) Persistencia {
 	c.log.Infof("    · BD [SIMULACIÓN] Operacion 0 (buscar) → SP %s(@Operacion=0, @Cufe=%s)", c.spName, cufe)
 	c.log.Infof("    · BD [SIMULACIÓN] Operacion 1 (actualizar) → SP %s(@Operacion=1, @Radicado=<Op0>, @Cufe=%s, @FechaHoraOriginal='%s' (UTC-5), @Mandato=%s)",
 		c.spName, cufe, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
 
+	notas := notasParaAdjunto(numDocumento)
 	insertables := 0
 	for _, a := range adjuntos {
 		if len(a.Contenido) == 0 {
 			c.log.Infof("    · BD [SIMULACIÓN] adjunto %q vacío, se omitiría", a.Nombre)
 			continue
 		}
-		notas := notasParaAdjunto(a.Extension, bl)
 		c.log.Infof("    · BD [SIMULACIÓN] Operacion 2 (insertar) → SP %s(@Operacion=2, @Radicado=<Op0>, @Cufe=%s, @NombreAdjunto=%s, @Extension=%s, @NotasAdjunto=%s, @Adjunto=%d bytes)",
 			c.spName, cufe, truncar(a.Nombre, maxNombreAdjunto), truncar(a.Extension, maxExtension), notasLog(notas), len(a.Contenido))
 		insertables++
@@ -265,13 +272,12 @@ func (c *Client) simular(cufe string, fechaCol time.Time, mandato, bl string, ad
 	return Persistencia{Estado: estado, Adjuntos: insertables}
 }
 
-// notasParaAdjunto devuelve el valor de @NotasAdjunto: el BL (truncado) para el
-// PDF si trae valor; NULL (nil) para el XML o cuando el BL viene vacío.
-func notasParaAdjunto(extension, bl string) *string {
-	if !strings.EqualFold(strings.TrimSpace(extension), "pdf") {
-		return nil
-	}
-	s := strings.TrimSpace(bl)
+// notasParaAdjunto devuelve el valor de @NotasAdjunto: el número de documento de
+// la factura (truncado) para TODOS los adjuntos —PDF, XML, JPG, TIF, DOCX…—, de
+// modo que todos queden referenciados al mismo documento; NULL (nil) si el
+// número de documento no está disponible.
+func notasParaAdjunto(numDocumento string) *string {
+	s := strings.TrimSpace(numDocumento)
 	if s == "" {
 		return nil
 	}

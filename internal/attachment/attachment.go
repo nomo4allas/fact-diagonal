@@ -1,11 +1,12 @@
 // Package attachment clasifica los adjuntos de un correo y normaliza su
 // contenido en "bundles" listos para extraer datos: cada bundle expone, como
-// máximo, un PDF y un XML provenientes de la misma factura.
+// máximo, un PDF y un XML provenientes de la misma factura, más los demás
+// archivos del ZIP (imágenes, DOCX, etc.) como "extras" para adjuntarlos.
 //
 // Soporta dos formas de entrega habituales en facturación electrónica DIAN:
-//   - Adjunto ZIP que contiene el PDF de representación gráfica y el XML UBL.
-//     El ZIP puede anidar otros ZIP; se descomprimen de forma recursiva hasta
-//     dar con los PDF/XML (ver maxZIPDepth).
+//   - Adjunto ZIP que contiene el PDF de representación gráfica y el XML UBL
+//     (y opcionalmente otros archivos: JPG/TIF/DOCX…). El ZIP puede anidar
+//     otros ZIP; se descomprimen de forma recursiva hasta maxZIPDepth niveles.
 //   - Adjunto PDF directo (sin XML de respaldo).
 package attachment
 
@@ -25,6 +26,18 @@ type Bundle struct {
 	PDFName string // nombre del PDF dentro del adjunto
 	XML     []byte // contenido del XML, o nil si no hay
 	XMLName string // nombre del XML dentro del adjunto
+	// Extras son los demás archivos del ZIP que no son PDF ni XML (JPG, TIF,
+	// DOCX, etc.). Se adjuntan a la misma factura para persistirlos en el
+	// Módulo 3. Solo el primer bundle de un ZIP los recibe, para no duplicarlos.
+	Extras []Extra
+}
+
+// Extra es un archivo del ZIP distinto de PDF/XML (imagen, DOCX, etc.) que
+// también debe adjuntarse a la factura en el Módulo 3.
+type Extra struct {
+	Name string // nombre exacto del archivo dentro del ZIP
+	Ext  string // extensión sin punto, en minúsculas (p.ej. "jpg", "docx")
+	Data []byte // contenido binario del archivo
 }
 
 // HasPDF indica si el bundle trae un PDF.
@@ -69,11 +82,13 @@ type doc struct {
 // FromZIP descomprime el ZIP y devuelve un bundle por cada PDF encontrado,
 // emparejándolo con el XML del mismo nombre base si existe; un XML suelto sin
 // PDF también genera su propio bundle. Esto cubre el caso típico (un PDF + un
-// XML) y los menos comunes (varios documentos en un mismo ZIP). Los ZIP
-// anidados se recorren de forma recursiva hasta maxZIPDepth niveles.
+// XML) y los menos comunes (varios documentos en un mismo ZIP). Los demás
+// archivos del ZIP (imágenes, DOCX, etc.) se acumulan como Extras del primer
+// bundle para adjuntarlos a la misma factura. Los ZIP anidados se recorren de
+// forma recursiva hasta maxZIPDepth niveles.
 func FromZIP(origin string, data []byte) ([]Bundle, error) {
-	var pdfs, xmls []doc
-	if err := collectDocs(origin, data, 1, &pdfs, &xmls); err != nil {
+	var pdfs, xmls, others []doc
+	if err := collectDocs(origin, data, 1, &pdfs, &xmls, &others); err != nil {
 		return nil, err
 	}
 
@@ -109,6 +124,16 @@ func FromZIP(origin string, data []byte) ([]Bundle, error) {
 	if len(bundles) == 0 {
 		return nil, fmt.Errorf("el ZIP %q no contiene PDF ni XML", origin)
 	}
+
+	// Los demás archivos del ZIP se adjuntan al primer bundle (todos referidos
+	// a la misma factura) para insertarlos una sola vez en el Módulo 3.
+	for _, o := range others {
+		bundles[0].Extras = append(bundles[0].Extras, Extra{
+			Name: o.name,
+			Ext:  extSinPunto(o.name),
+			Data: o.data,
+		})
+	}
 	return bundles, nil
 }
 
@@ -117,10 +142,11 @@ func FromPDF(name string, data []byte) Bundle {
 	return Bundle{Origin: name, PDF: data, PDFName: name}
 }
 
-// collectDocs recorre las entradas de un ZIP acumulando los PDF y XML en los
-// slices recibidos. Si encuentra un ZIP anidado desciende recursivamente
-// (depth+1) hasta maxZIPDepth para no caer en bucles ni ZIP bombs.
-func collectDocs(origin string, data []byte, depth int, pdfs, xmls *[]doc) error {
+// collectDocs recorre las entradas de un ZIP acumulando los PDF y XML en sus
+// slices y los demás archivos (imágenes, DOCX, etc.) en others. Si encuentra un
+// ZIP anidado desciende recursivamente (depth+1) hasta maxZIPDepth para no caer
+// en bucles ni ZIP bombs.
+func collectDocs(origin string, data []byte, depth int, pdfs, xmls, others *[]doc) error {
 	if depth > maxZIPDepth {
 		return fmt.Errorf("ZIP %q excede el máximo de %d niveles de anidamiento", origin, maxZIPDepth)
 	}
@@ -132,22 +158,24 @@ func collectDocs(origin string, data []byte, depth int, pdfs, xmls *[]doc) error
 		if f.FileInfo().IsDir() {
 			continue
 		}
-		ext := strings.ToLower(filepath.Ext(f.Name))
-		if ext != ".pdf" && ext != ".xml" && ext != ".zip" {
-			continue
-		}
 		content, err := readZipFile(f)
 		if err != nil {
 			return fmt.Errorf("error leyendo %q dentro de %q: %w", f.Name, origin, err)
 		}
-		switch ext {
+		switch strings.ToLower(filepath.Ext(f.Name)) {
 		case ".pdf":
 			*pdfs = append(*pdfs, doc{f.Name, content})
 		case ".xml":
 			*xmls = append(*xmls, doc{f.Name, content})
 		case ".zip":
-			if err := collectDocs(f.Name, content, depth+1, pdfs, xmls); err != nil {
+			if err := collectDocs(f.Name, content, depth+1, pdfs, xmls, others); err != nil {
 				return err
+			}
+		default:
+			// Cualquier otro archivo del ZIP se adjunta tal cual (JPG, TIF,
+			// DOCX, etc.). Sin extensión no hay tipo que registrar: se omite.
+			if extSinPunto(f.Name) != "" {
+				*others = append(*others, doc{f.Name, content})
 			}
 		}
 	}
@@ -168,4 +196,10 @@ func readZipFile(f *zip.File) ([]byte, error) {
 func baseNoExt(name string) string {
 	b := filepath.Base(name)
 	return strings.ToLower(strings.TrimSuffix(b, filepath.Ext(b)))
+}
+
+// extSinPunto devuelve la extensión del archivo en minúsculas y sin el punto
+// inicial (p.ej. "jpg"); "" si el archivo no tiene extensión.
+func extSinPunto(name string) string {
+	return strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")
 }

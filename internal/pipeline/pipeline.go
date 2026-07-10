@@ -277,6 +277,11 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	if b.HasXML() {
 		adjuntos = append(adjuntos, database.Adjunto{Nombre: b.XMLName, Extension: "xml", Contenido: b.XML})
 	}
+	// Los demás archivos del ZIP (JPG, TIF, DOCX, etc.) también se adjuntan a la
+	// factura, cada uno con su extensión real.
+	for _, ex := range b.Extras {
+		adjuntos = append(adjuntos, database.Adjunto{Nombre: ex.Name, Extension: ex.Ext, Contenido: ex.Data})
+	}
 	persist, err := p.db.PersistInvoice(ctx, res.Final, fechaCorreo, adjuntos)
 	if err != nil {
 		// Fallo técnico en la llamada al SP → ErrorTecnico: el llamador notifica a

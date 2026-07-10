@@ -126,6 +126,46 @@ func TestFromZIP_ExcedeLimiteAnidamiento(t *testing.T) {
 	}
 }
 
+func TestFromZIP_ArchivosExtra(t *testing.T) {
+	// ZIP con PDF + XML + otros archivos: los extras se adjuntan al primer
+	// bundle, cada uno con su extensión real (sin punto).
+	data := makeZIP(t, map[string]string{
+		"factura.pdf":   "%PDF-1.4",
+		"factura.xml":   "<Invoice/>",
+		"soporte.JPG":   "\xff\xd8\xff imagen",
+		"escaneo.tif":   "II* datos",
+		"contrato.docx": "PK docx",
+		"sinextension":  "se ignora",
+	})
+	bundles, err := FromZIP("adj.zip", data)
+	if err != nil {
+		t.Fatalf("FromZIP error: %v", err)
+	}
+	if len(bundles) != 1 {
+		t.Fatalf("se esperaba 1 bundle, hay %d", len(bundles))
+	}
+	extras := bundles[0].Extras
+	if len(extras) != 3 {
+		t.Fatalf("se esperaban 3 extras (jpg, tif, docx), hay %d: %+v", len(extras), extras)
+	}
+	got := make(map[string]string, len(extras)) // nombre → extensión
+	for _, e := range extras {
+		if len(e.Data) == 0 {
+			t.Errorf("extra %q sin contenido", e.Name)
+		}
+		got[e.Name] = e.Ext
+	}
+	want := map[string]string{"soporte.JPG": "jpg", "escaneo.tif": "tif", "contrato.docx": "docx"}
+	for name, ext := range want {
+		if got[name] != ext {
+			t.Errorf("extra %q: extensión = %q, want %q", name, got[name], ext)
+		}
+	}
+	if _, ok := got["sinextension"]; ok {
+		t.Error("un archivo sin extensión no debería adjuntarse como extra")
+	}
+}
+
 func TestClasificacion(t *testing.T) {
 	if !IsZIP("x.ZIP", "") {
 		t.Error("x.ZIP debería ser ZIP")
