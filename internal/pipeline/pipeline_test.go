@@ -65,8 +65,8 @@ const ublConCUFE = `<?xml version="1.0" encoding="UTF-8"?>
 
 // --- Pruebas ----------------------------------------------------------------
 
-// 1. Bundle sin datos aprovechables (XML ilegible y sin PDF) → Errores.
-func TestProcessBundle_SinDatos_Errores(t *testing.T) {
+// 1. Bundle sin CUFE (XML ilegible y sin PDF) → SinFactura, sin error técnico.
+func TestProcessBundle_SinCUFE_SinFactura(t *testing.T) {
 	p := &Processor{log: noopLogger{}} // sin db ni graph: no se alcanzan
 
 	b := attachment.Bundle{
@@ -76,16 +76,17 @@ func TestProcessBundle_SinDatos_Errores(t *testing.T) {
 	}
 
 	_, outcome, err := p.processBundle(context.Background(), b, time.Now())
-	if outcome != Errores {
-		t.Fatalf("outcome = %v; se esperaba Errores", outcome)
+	if outcome != SinFactura {
+		t.Fatalf("outcome = %v; se esperaba SinFactura", outcome)
 	}
-	if err == nil {
-		t.Error("se esperaba un detalle de error para notificar, pero err == nil")
+	if err != nil {
+		t.Errorf("SinFactura no es un error técnico; err debería ser nil, fue: %v", err)
 	}
 }
 
-// 2. Correo cuyos adjuntos no son procesables (no ZIP/PDF) → Errores.
-func TestProcessMessage_SinAdjuntosProcesables_Errores(t *testing.T) {
+// 2. Correo cuyos adjuntos no son procesables (no ZIP/PDF) → SinFactura: se
+// marcará como leído y se dejará donde está, sin error técnico.
+func TestProcessMessage_SinAdjuntosProcesables_SinFactura(t *testing.T) {
 	p := &Processor{
 		graph: fakeLister{atts: []graph.Attachment{
 			{Name: "aviso.txt", ContentType: "text/plain", ContentBytes: "aGVsbG8="},
@@ -94,11 +95,11 @@ func TestProcessMessage_SinAdjuntosProcesables_Errores(t *testing.T) {
 	}
 
 	rep := p.ProcessMessage(context.Background(), "buzon@x.co", graph.Message{ID: "m1"})
-	if rep.Outcome != Errores {
-		t.Fatalf("Outcome = %v; se esperaba Errores", rep.Outcome)
+	if rep.Outcome != SinFactura {
+		t.Fatalf("Outcome = %v; se esperaba SinFactura", rep.Outcome)
 	}
-	if rep.Err == nil {
-		t.Error("se esperaba rep.Err con el detalle para notificar, pero es nil")
+	if rep.Err != nil {
+		t.Errorf("SinFactura no es un error técnico; rep.Err debería ser nil, fue: %v", rep.Err)
 	}
 	if len(rep.Results) != 0 {
 		t.Errorf("no debería haber resultados; se obtuvieron %d", len(rep.Results))

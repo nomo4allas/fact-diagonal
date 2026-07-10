@@ -23,8 +23,12 @@ import (
 )
 
 const (
-	defaultModel = "gemini-2.5-flash"
-	endpointFmt  = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+	// Valores por defecto si el llamador no configura modelo/location. El modelo
+	// se lee de config.env (GEMINI_MODEL); gemini-2.5-flash fue deprecado por
+	// Google (404), por eso ya no se cablea aquí.
+	defaultModel    = "gemini-2.0-flash"
+	defaultLocation = "global"
+	endpointFmt     = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 
 	// La API devuelve 503/429 transitorios bajo alta demanda; reintentamos con
 	// backoff exponencial antes de rendirnos.
@@ -51,23 +55,41 @@ Si un dato no aparece, deja su valor como cadena vacía.`
 
 // Client habla con la API de Gemini.
 type Client struct {
-	apiKey string
-	model  string
-	http   *http.Client
+	apiKey   string
+	model    string
+	location string
+	http     *http.Client
 }
 
-// New crea un cliente de Gemini. Un apiKey vacío produce un cliente no
-// disponible (Available() == false).
-func New(apiKey string) *Client {
+// New crea un cliente de Gemini con el modelo y la location indicados (leídos de
+// config.env: GEMINI_MODEL y GEMINI_LOCATION). Si alguno viene vacío se usa el
+// valor por defecto. Un apiKey vacío produce un cliente no disponible
+// (Available() == false).
+func New(apiKey, model, location string) *Client {
 	return &Client{
-		apiKey: strings.TrimSpace(apiKey),
-		model:  defaultModel,
-		http:   &http.Client{Timeout: 60 * time.Second},
+		apiKey:   strings.TrimSpace(apiKey),
+		model:    orDefault(model, defaultModel),
+		location: orDefault(location, defaultLocation),
+		http:     &http.Client{Timeout: 60 * time.Second},
 	}
+}
+
+// orDefault devuelve v sin espacios, o def si v viene vacío.
+func orDefault(v, def string) string {
+	if s := strings.TrimSpace(v); s != "" {
+		return s
+	}
+	return def
 }
 
 // Available indica si hay una clave configurada.
 func (c *Client) Available() bool { return c.apiKey != "" }
+
+// Describe devuelve el modelo y la location configurados, para registrarlos en
+// el log al habilitar la cascada.
+func (c *Client) Describe() string {
+	return fmt.Sprintf("modelo=%s, location=%s", c.model, c.location)
+}
 
 // ---- Estructuras de la petición/respuesta REST ----
 

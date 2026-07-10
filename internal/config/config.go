@@ -19,6 +19,8 @@ type Config struct {
 	Mailbox        string // Buzón a leer, p.ej. facturae@diagonal.com.co
 	SimulationMode bool   // Si true, el agente solo lee y nunca modifica nada
 	GeminiAPIKey   string // Clave de Gemini API (opcional, último eslabón de la cascada)
+	GeminiModel    string // Modelo de Gemini a usar (por defecto gemini-2.0-flash)
+	GeminiLocation string // Región/location de Gemini (por defecto global)
 	FilterFrom     string // Opcional: si no está vacío, solo procesa correos cuyo remitente lo contenga (subcadena, case-insensitive)
 	MaxCorreos     int    // Máximo de correos a procesar por corrida (por defecto 5 si no se define)
 	SMTPTo         string // Destinatario de las notificaciones de error (p.ej. soporte@diagonal.com.co). El remitente es Mailbox.
@@ -63,6 +65,8 @@ func Load(path string) (*Config, error) {
 		Mailbox:        strings.TrimSpace(os.Getenv("MAILBOX")),
 		SimulationMode: parseBool(os.Getenv("SIMULATION_MODE"), true),
 		GeminiAPIKey:   strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
+		GeminiModel:    orDefault(os.Getenv("GEMINI_MODEL"), "gemini-2.0-flash"),
+		GeminiLocation: orDefault(os.Getenv("GEMINI_LOCATION"), "global"),
 		FilterFrom:     strings.TrimSpace(os.Getenv("FILTER_FROM")),
 		MaxCorreos:     parseInt(os.Getenv("MAX_CORREOS"), 5),
 		SMTPTo:         strings.TrimSpace(os.Getenv("SMTP_TO")),

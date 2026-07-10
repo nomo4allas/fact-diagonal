@@ -324,6 +324,23 @@ func (c *Client) MoveMessage(ctx context.Context, mailbox, messageID, destFolder
 	return nil
 }
 
+// MarkAsRead marca un correo como leído (isRead=true) mediante un PATCH a
+// /users/{mailbox}/messages/{id}. ESCRIBE en el buzón, por lo que el llamador
+// debe respetar SIMULATION_MODE (no invocarla en simulación, solo registrar en
+// el log lo que haría).
+func (c *Client) MarkAsRead(ctx context.Context, mailbox, messageID string) error {
+	rawURL := fmt.Sprintf("%s/users/%s/messages/%s",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(messageID))
+	payload, err := json.Marshal(map[string]bool{"isRead": true})
+	if err != nil {
+		return fmt.Errorf("error serializando el marcado como leído: %w", err)
+	}
+	if _, err := c.doJSON(ctx, http.MethodPatch, rawURL, payload, http.StatusOK); err != nil {
+		return fmt.Errorf("error marcando el correo como leído: %w", err)
+	}
+	return nil
+}
+
 // SendMail envía un correo de texto plano desde el buzón `from` al destinatario
 // `to` usando el endpoint sendMail de Graph. Graph responde 202 Accepted. ESCRIBE
 // (envía) desde el buzón, por lo que el llamador debe respetar SIMULATION_MODE.

@@ -12,16 +12,18 @@
 // los campos de recepción e inserta el PDF y el XML en la tabla Adjuntos.
 //
 // En cada corrida procesa (Mejora 2): (1) los correos no leídos de la bandeja de
-// entrada y (2) los correos de la carpeta /Pendientes. Lógica de carpetas:
-//   - /Procesados: extracción OK + BD OK.
-//   - /Pendientes: extracción OK + CUFE no encontrado en la BD.
-//   - /Errores:    la extracción falló por causa del agente (PDF corrupto/ilegible,
-//     ZIP mal formado, adjunto vacío, formato no reconocido, o la
-//     cascada no obtuvo datos y no había XML) → se notifica a soporte.
+// entrada y (2) los correos de la carpeta /Pendientes. Lógica de carpetas
+// (Ajuste 2):
+//   - /Procesados: hay factura con CUFE + BD OK.
+//   - /Pendientes: hay factura con CUFE pero el CUFE no se encontró en la BD.
+//   - Sin factura válida (adjunto no ZIP/PDF, ZIP sin PDF/XML aprovechable, o
+//     PDF/XML sin CUFE): el correo se marca como leído y se deja donde está; no
+//     se mueve a ninguna carpeta.
 //
-// Un fallo técnico externo se maneja aparte: error de BD/SP deja el correo en la
-// bandeja de entrada y notifica a soporte (Mejora 1); un error de conexión a M365
-// solo se registra en el log local. Al final se escribe un resumen de la corrida.
+// Un fallo técnico externo real se maneja aparte y NUNCA mueve el correo: error
+// de conexión a SQL Server o fallo del SP deja el correo donde estaba y notifica
+// a soporte (Mejora 1); un error de conexión a M365 solo se registra en el log
+// local. Al final se escribe un resumen de la corrida.
 //
 // Respeta SIMULATION_MODE: en simulación solo lee/registra lo que haría, sin
 // enviar correos de notificación, sin mover mensajes y sin escribir en la BD.
@@ -45,11 +47,11 @@ import (
 	"github.com/nomo4allas/fact-diagonal/internal/pipeline"
 )
 
-// Tipos de error para las notificaciones a soporte (Mejora 1).
+// Tipos de error para las notificaciones a soporte (Mejora 1). Solo errores
+// técnicos reales se notifican; un correo sin factura válida no es un error.
 const (
-	tipoErrorSQL        = "Conexión SQL Server"
-	tipoErrorSP         = "Llamada al SP"
-	tipoErrorExtraccion = "Extracción de adjunto"
+	tipoErrorSQL = "Conexión SQL Server"
+	tipoErrorSP  = "Llamada al SP"
 )
 
 // workItem es un correo a procesar junto con la carpeta de la que proviene
@@ -63,7 +65,7 @@ type workItem struct {
 type resumen struct {
 	procesados  int // correos con desenlace Procesados
 	pendientes  int // correos con desenlace Pendientes
-	conError    int // correos con desenlace Errores (fallo de extracción)
+	sinFactura  int // correos sin factura válida (marcados como leídos, sin mover)
 	erroresBD   int // correos detenidos por fallo de BD/SP
 	erroresM365 int // correos detenidos por fallo de conexión a M365
 }
@@ -75,7 +77,7 @@ func logResumen(lg *logger.Logger, inicio, fin time.Time, r resumen) {
 	lg.Infof("Fecha/hora fin:       %s", fin.Local().Format("2006-01-02 15:04:05"))
 	lg.Infof("Correos procesados:   %d", r.procesados)
 	lg.Infof("Correos pendientes:   %d", r.pendientes)
-	lg.Infof("Correos con error:    %d", r.conError)
+	lg.Infof("Correos sin factura:  %d", r.sinFactura)
 	lg.Infof("Errores de BD/SP:     %d", r.erroresBD)
 	lg.Infof("Errores de M365:      %d", r.erroresM365)
 	lg.Infof("Tiempo total:         %s", fin.Sub(inicio).Round(time.Second))
@@ -235,10 +237,11 @@ func main() {
 		return
 	}
 
+	gem := gemini.New(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiLocation)
 	if cfg.GeminiAPIKey == "" {
 		lg.Infof("Gemini: deshabilitado (GEMINI_API_KEY vacía); la cascada usará solo texto nativo y OCR.")
 	} else {
-		lg.Infof("Gemini: habilitado.")
+		lg.Infof("Gemini: habilitado (%s).", gem.Describe())
 	}
 
 	// ===================== Módulo 3 =====================
@@ -272,16 +275,17 @@ func main() {
 		lg.Infof("Módulo 3 deshabilitado: faltan credenciales de BD en config.env.")
 	}
 
-	gem := gemini.New(cfg.GeminiAPIKey)
 	proc := pipeline.New(gc, gem, db, lg, cfg.SimulationMode)
 
-	// Resolvemos (creándolas si faltan) las carpetas destino /Procesados,
-	// /Pendientes y /Errores. Solo fuera de simulación: en SIMULATION_MODE no se
-	// crea ni se mueve nada, solo se registra el destino en el log.
+	// Resolvemos (creándolas si faltan) las carpetas destino /Procesados y
+	// /Pendientes. Solo fuera de simulación: en SIMULATION_MODE no se crea ni se
+	// mueve nada, solo se registra el destino en el log. Ya no se usa /Errores como
+	// destino: un correo sin factura válida se marca como leído y se deja en su
+	// carpeta (Ajuste 2).
 	var carpetas map[string]string // nombre → folderID
 	if !cfg.SimulationMode {
-		carpetas = make(map[string]string, 3)
-		for _, name := range []string{"Procesados", "Pendientes", "Errores"} {
+		carpetas = make(map[string]string, 2)
+		for _, name := range []string{"Procesados", "Pendientes"} {
 			id, err := gc.ResolveInboxChildFolder(ctx, cfg.Mailbox, name)
 			if err != nil {
 				lg.Errorf("no se pudo resolver/crear la carpeta /%s: %v", name, err)
@@ -325,17 +329,25 @@ func main() {
 			continue
 		}
 
-		// Fallo de extracción por causa del agente (PDF corrupto/ilegible, ZIP mal
-		// formado, adjunto vacío, formato no reconocido, o cascada sin datos y sin
-		// XML): se notifica a soporte y el correo se mueve a /Errores.
-		if rep.Outcome == pipeline.Errores {
-			res.conError++
-			lg.Errorf("    error de extracción: %v", rep.Err)
-			notifier.Notify(ctx, tipoErrorExtraccion+" · "+subject, rep.Err.Error())
+		// Correo sin factura electrónica válida (adjunto no ZIP/PDF, ZIP sin
+		// PDF/XML aprovechable, o PDF/XML sin CUFE): NO es un error técnico. Se marca
+		// como leído y se deja donde está; no se mueve a ninguna carpeta.
+		if rep.Outcome == pipeline.SinFactura {
+			res.sinFactura++
+			lg.Infof("    correo sin factura electrónica válida: se deja en /%s.", it.source)
+			if cfg.SimulationMode {
+				lg.Infof("    [SIMULACIÓN] correo marcado como leído")
+			} else if err := gc.MarkAsRead(ctx, cfg.Mailbox, m.ID); err != nil {
+				// Un fallo al marcar es de conexión a M365 → solo log; queda donde estaba.
+				lg.Errorf("    no se pudo marcar el correo como leído (conexión M365): %v", err)
+			} else {
+				lg.Infof("    correo marcado como leído ✓")
+			}
+			continue
 		}
 
 		// Desenlace normal: destino según el Outcome.
-		destino := rep.Outcome.Folder() // "Procesados" | "Pendientes" | "Errores"
+		destino := rep.Outcome.Folder() // "Procesados" | "Pendientes"
 		switch rep.Outcome {
 		case pipeline.Procesados:
 			res.procesados++

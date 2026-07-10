@@ -9,7 +9,6 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -82,34 +81,37 @@ type Result struct {
 
 // Outcome clasifica el desenlace de un correo para decidir su carpeta destino
 // (ajuste "lógica de carpetas"). El valor entero codifica la severidad: al
-// agregar varios bundles de un mismo correo se conserva el de mayor severidad.
+// agregar varios bundles de un mismo correo se conserva el de mayor severidad,
+// de modo que si al menos un adjunto es una factura electrónica válida el correo
+// se mueve, aunque otros adjuntos no lo sean.
 type Outcome int
 
 const (
-	// Procesados: extracción OK + BD OK (factura persistida) → /Procesados.
-	Procesados Outcome = iota
-	// Pendientes: extracción OK pero el CUFE no se encontró en la BD (o el SP no
-	// insertó adjuntos) → /Pendientes, para reintento cuando la factura exista.
+	// SinFactura: el correo no trae una factura electrónica identificable. Cubre el
+	// adjunto que no es ZIP/PDF, el ZIP sin PDF/XML aprovechable y el PDF/XML sin
+	// CUFE. NO es un error técnico: el llamador marca el correo como leído y lo deja
+	// donde está (no lo mueve a ninguna carpeta). Es la severidad más baja para que
+	// un adjunto válido en el mismo correo prevalezca.
+	SinFactura Outcome = iota
+	// Procesados: hay factura con CUFE y la BD la persistió → /Procesados.
+	Procesados
+	// Pendientes: hay factura con CUFE pero el CUFE no se encontró en la BD (o el SP
+	// no insertó adjuntos) → /Pendientes, para reintento cuando la factura exista.
 	Pendientes
-	// Errores: la extracción falló por causa del agente (PDF corrupto/ilegible, ZIP
-	// mal formado, adjunto vacío, formato no reconocido, o la cascada no obtuvo
-	// datos y no había XML) → /Errores, con notificación a soporte.
-	Errores
-	// ErrorTecnico: fallo técnico externo (llamada al SP, descarga de adjuntos). El
-	// correo NO se mueve: queda donde estaba (bandeja de entrada).
+	// ErrorTecnico: fallo técnico externo real (conexión SQL Server, llamada al SP,
+	// conexión a M365). El correo NO se mueve ni se marca: queda donde estaba.
 	ErrorTecnico
 )
 
 // Folder devuelve el nombre de la subcarpeta de Inbox asociada al desenlace, o
-// "" para ErrorTecnico (que no implica movimiento: el correo queda donde estaba).
+// "" cuando no implica movimiento (SinFactura se deja donde está tras marcarlo
+// como leído; ErrorTecnico queda donde estaba).
 func (o Outcome) Folder() string {
 	switch o {
 	case Procesados:
 		return "Procesados"
 	case Pendientes:
 		return "Pendientes"
-	case Errores:
-		return "Errores"
 	default:
 		return ""
 	}
@@ -189,33 +191,23 @@ func (p *Processor) ProcessMessage(ctx context.Context, mailbox string, msg grap
 	}
 
 	if len(bundles) == 0 {
-		// Correo sin adjunto de factura válido por causa del agente (formato no
-		// reconocido, adjunto vacío o ZIP mal formado que no dejó documentos) →
-		// Errores: se mueve a /Errores y se notifica a soporte.
-		p.log.Errorf("    · sin adjuntos procesables (ZIP/PDF) en este correo → Errores")
-		return Report{Outcome: Errores, Err: errors.New("el correo no contiene adjuntos procesables (formato no reconocido, adjunto vacío o ZIP mal formado)")}
+		// El correo no trae adjuntos ZIP/PDF procesables (formato no reconocido,
+		// adjunto vacío o ZIP mal formado que no dejó documentos). No es un error
+		// técnico: el correo se marca como leído y se deja donde está.
+		p.log.Infof("    · sin adjuntos procesables (ZIP/PDF) en este correo → se marcará como leído y se dejará donde está")
+		return Report{Outcome: SinFactura}
 	}
 
 	var results []Result
-	outcome := Procesados
-	var erroresErr error // primer detalle de fallo de extracción, para notificar
+	outcome := SinFactura
 	for _, b := range bundles {
 		res, o, err := p.processBundle(ctx, b, msg.ReceivedDateTime)
 		results = append(results, res)
-		switch o {
-		case ErrorTecnico:
+		if o == ErrorTecnico {
 			// Fallo técnico del Módulo 3 (llamada al SP) → notificar y no mover.
 			return Report{Results: results, Outcome: ErrorTecnico, ErrKind: KindSP, Err: err}
-		case Errores:
-			// Fallo de extracción por causa del agente; conservamos el primer detalle.
-			if erroresErr == nil {
-				erroresErr = err
-			}
 		}
 		outcome = peor(outcome, o)
-	}
-	if outcome == Errores {
-		return Report{Results: results, Outcome: Errores, Err: erroresErr}
 	}
 	return Report{Results: results, Outcome: outcome}
 }
@@ -254,13 +246,14 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	p.logDiscrepancies(res)
 	p.logFinal(res.Final)
 
-	// Si no se pudo extraer ningún campo clave, la extracción falló por causa del
-	// agente: PDF corrupto/ilegible, adjunto vacío, o la cascada (incluida Gemini)
-	// no obtuvo datos y no había XML. → Errores (mover a /Errores + notificar). No
-	// se toca la BD.
-	if res.Final.FilledCount() == 0 {
-		p.log.Errorf("    · sin datos aprovechables en el bundle %q (PDF ilegible/vacío o extracción fallida) → Errores", b.Origin)
-		return res, Errores, fmt.Errorf("no se pudieron extraer datos del adjunto %q (PDF ilegible/vacío o extracción fallida sin XML de respaldo)", b.Origin)
+	// El CUFE es lo que identifica una factura electrónica (DIAN). Si el
+	// consolidado no trae CUFE, el adjunto no es una factura electrónica
+	// identificable (PDF ordinario, XML sin CUFE, PDF ilegible/vacío…). No es un
+	// error técnico: el correo se marcará como leído y se dejará donde está. No se
+	// toca la BD.
+	if strings.TrimSpace(res.Final.CUFE) == "" {
+		p.log.Infof("    · sin CUFE en el bundle %q (no es factura electrónica identificable) → se marcará el correo como leído y se dejará donde está", b.Origin)
+		return res, SinFactura, nil
 	}
 
 	// 4) Módulo 3: persistir en SQL Server (si está configurado).
