@@ -77,6 +77,27 @@ func TestTruncar(t *testing.T) {
 	}
 }
 
+// TestAdjuntoYaRegistrado verifica que el mensaje "ya registrado" del SP se
+// detecte como éxito idempotente, sin importar mayúsculas/minúsculas.
+func TestAdjuntoYaRegistrado(t *testing.T) {
+	casos := []struct {
+		mensaje string
+		want    bool
+	}{
+		{"El adjunto ya registrado", true},
+		{"YA REGISTRADO en el sistema", true},
+		{"Documento Ya Registrado previamente", true},
+		{"Insertado correctamente", false},
+		{"", false},
+		{"registrado", false},
+	}
+	for _, k := range casos {
+		if got := adjuntoYaRegistrado(k.mensaje); got != k.want {
+			t.Errorf("adjuntoYaRegistrado(%q) = %v, want %v", k.mensaje, got, k.want)
+		}
+	}
+}
+
 // TestNotasParaAdjunto verifica @NotasAdjunto: el número de documento (recortado)
 // para cualquier adjunto, o NULL cuando no está disponible.
 func TestNotasParaAdjunto(t *testing.T) {
