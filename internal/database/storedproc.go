@@ -174,21 +174,21 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 			c.log.Errorf("    · BD: Operacion 2 (insertar %s %q) falló: %v", a.Extension, a.Nombre, err)
 			return Persistencia{}, err
 		}
-		if res2 <= 0 {
-			// El SP responde @Resultado=0 con "ya registrado" cuando el adjunto
-			// ya se había insertado en una corrida anterior. Eso es un éxito
-			// (el adjunto está en la BD), no un fallo: se cuenta como insertado
-			// y no impide clasificar el correo en Procesados.
-			if adjuntoYaRegistrado(msg2) {
-				c.log.Infof("    · BD: Operacion 2 (insertar %s %q) → adjunto ya registrado previamente (Mensaje=%q); se trata como éxito", a.Extension, a.Nombre, msg2)
-				insertados++
-				continue
-			}
+		// El SP marca "ya registrado" cuando el adjunto ya se había insertado en
+		// una corrida anterior. El SP de producción devuelve ese caso con
+		// @Resultado = IdAdjunto (>0); antes lo devolvía con @Resultado=0. En
+		// ambos casos el adjunto está en la BD (éxito idempotente), por lo que el
+		// fallo real es solo @Resultado=0 SIN el mensaje de "ya registrado".
+		if !adjuntoPersistido(res2, msg2) {
 			c.log.Infof("    · BD: ⚠ Operacion 2 (insertar %s %q) devolvió 0 (Mensaje=%q)", a.Extension, a.Nombre, msg2)
 			todosOK = false
 			continue
 		}
-		c.log.Infof("    · BD: Operacion 2 (insertar %s %q, %d bytes) OK → Resultado=%d", a.Extension, a.Nombre, len(a.Contenido), res2)
+		if adjuntoYaRegistrado(msg2) {
+			c.log.Infof("    · BD: Operacion 2 (insertar %s %q) → adjunto ya registrado previamente (Resultado=%d, Mensaje=%q); se trata como éxito", a.Extension, a.Nombre, res2, msg2)
+		} else {
+			c.log.Infof("    · BD: Operacion 2 (insertar %s %q, %d bytes) OK → Resultado=%d", a.Extension, a.Nombre, len(a.Contenido), res2)
+		}
 		insertados++
 	}
 
@@ -294,10 +294,21 @@ func notasParaAdjunto(numDocumento string) *string {
 	return &s
 }
 
+// adjuntoPersistido decide si el resultado de la Operacion 2 debe contarse como
+// un adjunto efectivamente persistido en la BD. Es éxito si el SP devolvió un
+// IdAdjunto (@Resultado>0) o si el mensaje indica que el adjunto ya estaba
+// registrado de una corrida previa (éxito idempotente), sin importar el valor de
+// @Resultado. El único fallo real es @Resultado=0 con un mensaje que NO contiene
+// "ya registrado".
+func adjuntoPersistido(resultado int, mensaje string) bool {
+	return resultado > 0 || adjuntoYaRegistrado(mensaje)
+}
+
 // adjuntoYaRegistrado indica si el mensaje del SP para la Operacion 2 señala que
-// el adjunto ya existía en la BD (insertado en una corrida previa). En ese caso
-// @Resultado=0 no es un fallo sino un éxito idempotente. La comparación es
-// insensible a mayúsculas/minúsculas.
+// el adjunto ya existía en la BD (insertado en una corrida previa). Es un éxito
+// idempotente: el SP de producción lo reporta con @Resultado = IdAdjunto (>0),
+// aunque antes lo hacía con @Resultado=0; por eso la decisión se basa en el
+// mensaje, no en @Resultado. La comparación es insensible a mayúsculas/minúsculas.
 func adjuntoYaRegistrado(mensaje string) bool {
 	return strings.Contains(strings.ToLower(mensaje), "ya registrado")
 }

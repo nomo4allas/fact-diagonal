@@ -84,6 +84,7 @@ func TestAdjuntoYaRegistrado(t *testing.T) {
 		mensaje string
 		want    bool
 	}{
+		{"Adjunto ya registrado.", true}, // mensaje exacto del SP de producción
 		{"El adjunto ya registrado", true},
 		{"YA REGISTRADO en el sistema", true},
 		{"Documento Ya Registrado previamente", true},
@@ -94,6 +95,30 @@ func TestAdjuntoYaRegistrado(t *testing.T) {
 	for _, k := range casos {
 		if got := adjuntoYaRegistrado(k.mensaje); got != k.want {
 			t.Errorf("adjuntoYaRegistrado(%q) = %v, want %v", k.mensaje, got, k.want)
+		}
+	}
+}
+
+// TestAdjuntoPersistido verifica la regla de éxito/fallo de la Operacion 2 con el
+// SP de producción actualizado: "ya registrado" es éxito para cualquier valor de
+// @Resultado (antes venía con 0, ahora con el IdAdjunto>0); el único fallo real
+// es @Resultado=0 sin ese mensaje.
+func TestAdjuntoPersistido(t *testing.T) {
+	casos := []struct {
+		nombre    string
+		resultado int
+		mensaje   string
+		want      bool
+	}{
+		{"inserción nueva (IdAdjunto>0)", 1234, "Adjunto insertado.", true},
+		{"ya registrado con IdAdjunto>0 (SP nuevo)", 1234, "Adjunto ya registrado.", true},
+		{"ya registrado con Resultado=0 (SP antiguo)", 0, "Adjunto ya registrado.", true},
+		{"fallo real: Resultado=0 sin 'ya registrado'", 0, "No existe el radicado.", false},
+		{"fallo real: Resultado=0 y mensaje vacío", 0, "", false},
+	}
+	for _, k := range casos {
+		if got := adjuntoPersistido(k.resultado, k.mensaje); got != k.want {
+			t.Errorf("%s: adjuntoPersistido(%d,%q) = %v, want %v", k.nombre, k.resultado, k.mensaje, got, k.want)
 		}
 	}
 }
