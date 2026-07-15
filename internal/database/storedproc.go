@@ -27,6 +27,9 @@ const (
 	maxNombreAdjunto = 500
 	maxNotasAdjunto  = 500
 	maxExtension     = 10
+	maxNIT           = 20
+	maxNumDoc        = 20
+	maxPrefijo       = 20
 )
 
 // EstadoBD resume el desenlace de la persistencia de una factura; el pipeline lo
@@ -83,6 +86,14 @@ type spParams struct {
 	NombreAdjunto     string
 	Extension         string
 	Adjunto           []byte // nil/vacío → NULL
+
+	// Datos de respaldo de la Operacion 0: si el CUFE no aparece, el SP busca el
+	// radicado por NIT + número de documento + prefijo. Los tres son varchar(20)
+	// en el SP. Aquí solo se envían; el fallback (incluida la separación del
+	// prefijo dentro de @NumDoc) lo resuelve el SP internamente.
+	NIT     string // @nit: solo dígitos, sin dígito de verificación ("" → NULL)
+	NumDoc  string // @NumDoc: número de documento tal cual ("" → NULL)
+	Prefijo string // @Prefijo: prefijo del número de factura ("" → NULL)
 }
 
 // PersistInvoice ejecuta el flujo del Módulo 3 para una factura, orquestando las
@@ -114,20 +125,26 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 	mandato := truncar(strings.TrimSpace(data.Pedido), maxMandato)
 
 	if c.simulation {
-		return c.simular(cufe, fechaCol, mandato, data.Numero, adjuntos), nil
+		return c.simular(data, cufe, fechaCol, mandato, adjuntos), nil
 	}
 
-	// 1) Operacion 0 — buscar por CUFE.
+	// 1) Operacion 0 — buscar por CUFE (con los datos de respaldo por si el SP
+	// necesita caer al fallback NIT + número + prefijo).
+	nit, numDoc, prefijo := datosBusqueda(data)
 	radicado, msg, err := c.callSP(ctx, spParams{
 		Operacion:         opBuscarCUFE,
 		Cufe:              cufe,
 		FechaHoraOriginal: fechaCol,
+		NIT:               nit,
+		NumDoc:            numDoc,
+		Prefijo:           prefijo,
 	})
 	if err != nil {
 		c.log.Errorf("    · BD: Operacion 0 (buscar CUFE) falló: %v", err)
 		return Persistencia{}, err
 	}
-	c.log.Infof("    · BD: Operacion 0 (buscar CUFE=%s) → Radicado=%d, Mensaje=%q", cufe, radicado, msg)
+	c.log.Infof("    · BD: Operacion 0 (buscar CUFE=%s, @nit=%s, @NumDoc=%s, @Prefijo=%s) → Radicado=%d, Mensaje=%q",
+		cufe, orNULL(nit), orNULL(numDoc), orNULL(prefijo), radicado, msg)
 	if radicado <= 0 {
 		c.log.Infof("    · BD: CUFE no encontrado (Operacion 0 devolvió 0) → pendiente")
 		return Persistencia{Estado: EstadoNoHallado}, nil
@@ -208,8 +225,13 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 //     lo usa para validar que el registro exista antes de insertar.
 //   - @FechaHoraOriginal y @Mandato: aplican a la búsqueda (0) y la
 //     actualización (1); NULL en la inserción de adjunto (2).
+//   - @nit, @NumDoc y @Prefijo: solo aplican a la búsqueda (0), donde el SP los
+//     usa como respaldo si el CUFE no aparece; NULL en las demás operaciones.
 //   - @NotasAdjunto, @NombreAdjunto, @Extension y @Adjunto: solo aplican a la
 //     inserción de adjunto (2); NULL en las demás operaciones.
+//
+// Los sql.Named se listan en el mismo orden que la firma del SP por legibilidad;
+// el enlace es por nombre, así que el orden no altera la llamada.
 func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje string, err error) {
 	// @Cufe viaja en las tres operaciones (el SP lo valida también en la Op 2).
 	cufe := any(p.Cufe)
@@ -220,6 +242,9 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 		fechaHora = p.FechaHoraOriginal
 		mandato = p.Mandato
 	}
+
+	// Datos de respaldo: solo en la Operacion 0 (buscar).
+	nit, numDoc, prefijo := p.argsBusqueda()
 
 	// Campos de adjunto: NULL salvo en la Operacion 2 (insertar adjunto).
 	var notas, nombreAdjunto, extension, adjunto any // nil → NULL
@@ -238,6 +263,9 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 		sql.Named("Operacion", p.Operacion),
 		sql.Named("Cufe", cufe),
 		sql.Named("Radicado", p.Radicado),
+		sql.Named("nit", nit),
+		sql.Named("NumDoc", numDoc),
+		sql.Named("Prefijo", prefijo),
 		sql.Named("FechaHoraOriginal", fechaHora),
 		sql.Named("Mandato", mandato),
 		sql.Named("NotasAdjunto", notas),
@@ -257,12 +285,14 @@ func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje
 // ejecutarlo. Como no se llama a la Operacion 0, no hay radicado real: se usa el
 // marcador 0 y se asume el desenlace que tendría un flujo exitoso, para que la
 // clasificación de carpetas en simulación sea representativa.
-func (c *Client) simular(cufe string, fechaCol time.Time, mandato, numDocumento string, adjuntos []Adjunto) Persistencia {
-	c.log.Infof("    · BD [SIMULACIÓN] Operacion 0 (buscar) → SP %s(@Operacion=0, @Cufe=%s)", c.spName, cufe)
+func (c *Client) simular(data invoice.Data, cufe string, fechaCol time.Time, mandato string, adjuntos []Adjunto) Persistencia {
+	nit, numDoc, prefijo := datosBusqueda(data)
+	c.log.Infof("    · BD [SIMULACIÓN] Operacion 0 (buscar) → SP %s(@Operacion=0, @Cufe=%s, @nit=%s, @NumDoc=%s, @Prefijo=%s)",
+		c.spName, cufe, orNULL(nit), orNULL(numDoc), orNULL(prefijo))
 	c.log.Infof("    · BD [SIMULACIÓN] Operacion 1 (actualizar) → SP %s(@Operacion=1, @Radicado=<Op0>, @Cufe=%s, @FechaHoraOriginal='%s' (UTC-5), @Mandato=%s)",
 		c.spName, cufe, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
 
-	notas := notasParaAdjunto(numDocumento)
+	notas := notasParaAdjunto(data.Numero)
 	insertables := 0
 	for _, a := range adjuntos {
 		if len(a.Contenido) == 0 {
@@ -293,6 +323,73 @@ func notasParaAdjunto(numDocumento string) *string {
 	s = truncar(s, maxNotasAdjunto)
 	return &s
 }
+
+// argsBusqueda reparte @nit, @NumDoc y @Prefijo: llevan valor solo en la
+// Operacion 0 (buscar), que es donde el SP los usa como respaldo del CUFE, y
+// viajan NULL en las Operaciones 1 y 2 aunque spParams los traiga poblados.
+//
+// Dentro de la Operacion 0 cada uno es independiente: el que no se pudo obtener
+// va NULL, para que el SP no intente un fallback con un valor vacío que podría
+// emparejar el radicado equivocado.
+func (p spParams) argsBusqueda() (nit, numDoc, prefijo any) { // nil → NULL
+	if p.Operacion != opBuscarCUFE {
+		return nil, nil, nil
+	}
+	if p.NIT != "" {
+		nit = p.NIT
+	}
+	if p.NumDoc != "" {
+		numDoc = p.NumDoc
+	}
+	if p.Prefijo != "" {
+		prefijo = p.Prefijo
+	}
+	return nit, numDoc, prefijo
+}
+
+// datosBusqueda arma los tres datos de respaldo que la Operacion 0 envía junto
+// al CUFE (@nit, @NumDoc, @Prefijo) para que el SP pueda localizar el radicado
+// por NIT + número + prefijo cuando el CUFE no aparece. Los tres son varchar(20)
+// en el SP; aquí solo se recortan a ese límite y se envían: la lógica de
+// búsqueda vive dentro del SP.
+//
+// @NumDoc va tal como lo dejó el extractor ("FES15380" se envía completo, con su
+// prefijo): es el SP el que separa prefijo y consecutivo.
+//
+// @Prefijo se pasa a mayúsculas: en la BD los prefijos están en mayúsculas y la
+// comparación del SP puede ser sensible a mayúsculas.
+//
+// Cada dato es independiente: si alguno no se pudo obtener viaja como NULL y los
+// demás igual se envían.
+func datosBusqueda(data invoice.Data) (nit, numDoc, prefijo string) {
+	nit = truncar(normalizeNIT(data.NIT), maxNIT)
+	numDoc = truncar(strings.TrimSpace(data.Numero), maxNumDoc)
+	prefijo = truncar(strings.ToUpper(strings.TrimSpace(data.Prefijo)), maxPrefijo)
+	return nit, numDoc, prefijo
+}
+
+// normalizeNIT deja el NIT del emisor listo para @nit: solo los dígitos, sin
+// puntos ni espacios y sin el dígito de verificación ("900.123.456-7" →
+// "900123456"). El DV es el que sigue al último guion; si el NIT llega sin guion
+// se asume que ya viene sin DV ("901234567" → "901234567"), que es como lo trae
+// el cbc:CompanyID del XML de la DIAN. Devuelve "" si no queda ningún dígito.
+func normalizeNIT(nit string) string {
+	s := strings.TrimSpace(nit)
+	if i := strings.LastIndex(s, "-"); i >= 0 {
+		s = s[:i]
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if esDigito(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// esDigito acota la comprobación a los dígitos ASCII: unicode.IsDigit aceptaría
+// dígitos de otros alfabetos que luego no se podrían convertir a int.
+func esDigito(r rune) bool { return r >= '0' && r <= '9' }
 
 // adjuntoPersistido decide si el resultado de la Operacion 2 debe contarse como
 // un adjunto efectivamente persistido en la BD. Es éxito si el SP devolvió un
