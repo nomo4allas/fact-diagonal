@@ -17,6 +17,11 @@ import (
 
 const baseURL = "https://graph.microsoft.com/v1.0"
 
+// InboxWellKnown es el nombre "bien conocido" de la Bandeja de entrada. Graph lo
+// acepta en la URL allí donde espera un folderID, así que sirve como carpeta raíz
+// por defecto cuando INBOX_FOLDER no está configurada.
+const InboxWellKnown = "Inbox"
+
 // Client encapsula un *http.Client ya autenticado contra Graph.
 type Client struct {
 	http *http.Client
@@ -69,12 +74,14 @@ type messagesResponse struct {
 	NextLink string    `json:"@odata.nextLink"`
 }
 
-// ListUnreadMessages devuelve todos los correos NO leídos de la bandeja de
-// entrada del buzón indicado, siguiendo la paginación de Graph.
+// ListUnreadMessages devuelve todos los correos NO leídos de la carpeta de
+// entrada indicada (folderID), siguiendo la paginación de Graph. folderID puede
+// ser InboxWellKnown para la Bandeja de entrada, o el ID de la carpeta que
+// resuelva INBOX_FOLDER.
 //
 // Es una operación estrictamente de lectura: no marca como leído ni mueve
 // ningún mensaje.
-func (c *Client) ListUnreadMessages(ctx context.Context, mailbox string) ([]Message, error) {
+func (c *Client) ListUnreadMessages(ctx context.Context, mailbox, folderID string) ([]Message, error) {
 	// Construimos la primera URL con el filtro y los campos seleccionados.
 	q := url.Values{}
 	q.Set("$filter", "isRead eq false")
@@ -82,8 +89,8 @@ func (c *Client) ListUnreadMessages(ctx context.Context, mailbox string) ([]Mess
 	q.Set("$orderby", "receivedDateTime DESC")
 	q.Set("$top", "50")
 
-	next := fmt.Sprintf("%s/users/%s/mailFolders/Inbox/messages?%s",
-		baseURL, url.PathEscape(mailbox), q.Encode())
+	next := fmt.Sprintf("%s/users/%s/mailFolders/%s/messages?%s",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(folderID), q.Encode())
 
 	var all []Message
 	for next != "" {
@@ -223,8 +230,12 @@ func (c *Client) ListAttachments(ctx context.Context, mailbox, messageID string)
 // ---------------------------------------------------------------------------
 // Manejo de carpetas del buzón (ajuste "lógica de carpetas").
 //
-// Las carpetas destino (Procesados/Pendientes) son SUBCARPETAS de Inbox.
-// ResolveInboxChildFolder las localiza por displayName y las crea si no existen;
+// Las carpetas destino (Procesados/Pendientes) son SUBCARPETAS de la carpeta de
+// entrada, que por defecto es la Bandeja de entrada (InboxWellKnown) pero puede
+// ser la que configure INBOX_FOLDER: así una corrida de pruebas queda contenida
+// en su propia carpeta y no toca el árbol real de Inbox.
+//
+// ResolveChildFolder las localiza por displayName y las crea si no existen;
 // MoveMessage mueve un correo a una carpeta. Ambas operaciones ESCRIBEN en el
 // buzón, por lo que el llamador debe respetar SIMULATION_MODE (no invocarlas en
 // simulación, solo registrar en el log lo que haría).
@@ -241,44 +252,70 @@ type mailFoldersResponse struct {
 	NextLink string       `json:"@odata.nextLink"`
 }
 
-// FindInboxChildFolder localiza (solo lectura, sin crear) una subcarpeta de
-// Inbox por displayName. Devuelve su ID y found=true si existe. Se usa para
-// releer /Pendientes sin crearla: en SIMULATION_MODE no se debe crear nada.
-func (c *Client) FindInboxChildFolder(ctx context.Context, mailbox, displayName string) (id string, found bool, err error) {
-	return c.findInboxChildFolder(ctx, mailbox, displayName)
+// FindInboxFolder localiza (solo lectura, sin crear) la carpeta de entrada que
+// configura INBOX_FOLDER, por displayName. Devuelve su ID y found=true si existe.
+//
+// Busca en dos sitios, en este orden: (1) las carpetas de primer nivel del buzón
+// (hermanas de la Bandeja de entrada, que es donde suele crearse una carpeta como
+// "Pruebas") y (2) las subcarpetas de la Bandeja de entrada. Así funciona con
+// cualquiera de las dos disposiciones habituales; si existieran ambas, gana la de
+// primer nivel.
+//
+// Nunca crea la carpeta: si no existe, el llamador debe detenerse en vez de caer
+// en la Bandeja de entrada real (ver main.go).
+func (c *Client) FindInboxFolder(ctx context.Context, mailbox, displayName string) (id string, found bool, err error) {
+	raiz := fmt.Sprintf("%s/users/%s/mailFolders", baseURL, url.PathEscape(mailbox))
+	if id, found, err := c.findFolderIn(ctx, raiz, displayName); err != nil || found {
+		return id, found, err
+	}
+	return c.findChildFolder(ctx, mailbox, InboxWellKnown, displayName)
 }
 
-// ResolveInboxChildFolder devuelve el ID de la subcarpeta de Inbox con el
+// FindChildFolder localiza (solo lectura, sin crear) una subcarpeta de parentID
+// por displayName. Devuelve su ID y found=true si existe. Se usa para releer
+// /Pendientes sin crearla: en SIMULATION_MODE no se debe crear nada.
+func (c *Client) FindChildFolder(ctx context.Context, mailbox, parentID, displayName string) (id string, found bool, err error) {
+	return c.findChildFolder(ctx, mailbox, parentID, displayName)
+}
+
+// ResolveChildFolder devuelve el ID de la subcarpeta de parentID con el
 // displayName indicado, creándola si no existe. La comparación de nombre es
 // case-insensitive.
-func (c *Client) ResolveInboxChildFolder(ctx context.Context, mailbox, displayName string) (string, error) {
-	id, found, err := c.findInboxChildFolder(ctx, mailbox, displayName)
+func (c *Client) ResolveChildFolder(ctx context.Context, mailbox, parentID, displayName string) (string, error) {
+	id, found, err := c.findChildFolder(ctx, mailbox, parentID, displayName)
 	if err != nil {
 		return "", err
 	}
 	if found {
 		return id, nil
 	}
-	return c.createInboxChildFolder(ctx, mailbox, displayName)
+	return c.createChildFolder(ctx, mailbox, parentID, displayName)
 }
 
-// findInboxChildFolder busca (siguiendo la paginación) una subcarpeta de Inbox
-// por displayName.
-func (c *Client) findInboxChildFolder(ctx context.Context, mailbox, displayName string) (string, bool, error) {
+// findChildFolder busca (siguiendo la paginación) una subcarpeta de parentID por
+// displayName.
+func (c *Client) findChildFolder(ctx context.Context, mailbox, parentID, displayName string) (string, bool, error) {
+	base := fmt.Sprintf("%s/users/%s/mailFolders/%s/childFolders",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(parentID))
+	return c.findFolderIn(ctx, base, displayName)
+}
+
+// findFolderIn recorre una colección de carpetas de Graph (con paginación) y
+// devuelve la primera cuyo displayName coincida (case-insensitive).
+func (c *Client) findFolderIn(ctx context.Context, colURL, displayName string) (string, bool, error) {
 	q := url.Values{}
 	q.Set("$select", "id,displayName")
 	q.Set("$top", "100")
-	next := fmt.Sprintf("%s/users/%s/mailFolders/Inbox/childFolders?%s",
-		baseURL, url.PathEscape(mailbox), q.Encode())
+	next := colURL + "?" + q.Encode()
 
 	for next != "" {
 		body, err := c.doGET(ctx, next)
 		if err != nil {
-			return "", false, fmt.Errorf("error listando subcarpetas de Inbox: %w", err)
+			return "", false, fmt.Errorf("error listando carpetas del buzón: %w", err)
 		}
 		var out mailFoldersResponse
 		if err := json.Unmarshal(body, &out); err != nil {
-			return "", false, fmt.Errorf("error decodificando subcarpetas de Inbox: %w", err)
+			return "", false, fmt.Errorf("error decodificando las carpetas del buzón: %w", err)
 		}
 		for _, f := range out.Value {
 			if strings.EqualFold(f.DisplayName, displayName) {
@@ -290,10 +327,10 @@ func (c *Client) findInboxChildFolder(ctx context.Context, mailbox, displayName 
 	return "", false, nil
 }
 
-// createInboxChildFolder crea una subcarpeta bajo Inbox y devuelve su ID.
-func (c *Client) createInboxChildFolder(ctx context.Context, mailbox, displayName string) (string, error) {
-	rawURL := fmt.Sprintf("%s/users/%s/mailFolders/Inbox/childFolders",
-		baseURL, url.PathEscape(mailbox))
+// createChildFolder crea una subcarpeta bajo parentID y devuelve su ID.
+func (c *Client) createChildFolder(ctx context.Context, mailbox, parentID, displayName string) (string, error) {
+	rawURL := fmt.Sprintf("%s/users/%s/mailFolders/%s/childFolders",
+		baseURL, url.PathEscape(mailbox), url.PathEscape(parentID))
 	payload, err := json.Marshal(map[string]string{"displayName": displayName})
 	if err != nil {
 		return "", fmt.Errorf("error serializando la creación de carpeta %q: %w", displayName, err)

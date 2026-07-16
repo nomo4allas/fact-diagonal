@@ -17,6 +17,7 @@ type Config struct {
 	ClientID       string // ID de la aplicación registrada (App registration)
 	ClientSecret   string // Secreto del cliente
 	Mailbox        string // Buzón a leer, p.ej. facturae@diagonal.com.co
+	InboxFolder    string // Opcional: carpeta de entrada (displayName) a leer en lugar de la Bandeja de entrada. Vacía → Inbox.
 	SimulationMode bool   // Si true, el agente solo lee y nunca modifica nada
 	GeminiAPIKey   string // Clave de Gemini API (opcional, último eslabón de la cascada)
 	GeminiModel    string // Modelo de Gemini a usar (por defecto gemini-2.0-flash)
@@ -25,10 +26,10 @@ type Config struct {
 	MaxCorreos     int    // Máximo de correos a procesar por corrida (por defecto 5 si no se define)
 	SMTPTo         string // Destinatario de las notificaciones de error (p.ej. soporte@diagonal.com.co). El remitente es Mailbox.
 
-	// Licenciamiento (Nivel 1 + Nivel 2). Ver internal/license.
-	AllowedHost string // Hostname autorizado del servidor (Nivel 1)
-	ClientName  string // Nombre del cliente al que se licencia (entra en el HMAC)
-	LicenseKey  string // Clave de licencia HMAC-SHA256 en hex (Nivel 2)
+	// Licenciamiento. Ver internal/license.
+	AllowedHost string // OBSOLETO: se ignora en la validación (se conserva por compatibilidad)
+	ClientName  string // Nombre del cliente al que se licencia (única entrada del HMAC)
+	LicenseKey  string // Clave de licencia HMAC-SHA256 en hex
 
 	// Módulo 3 — SQL Server. Opcionales: si DBServer está vacío, el módulo se omite.
 	DBServer   string // host del servidor SQL Server
@@ -63,6 +64,7 @@ func Load(path string) (*Config, error) {
 		ClientID:       strings.TrimSpace(os.Getenv("CLIENT_ID")),
 		ClientSecret:   strings.TrimSpace(os.Getenv("CLIENT_SECRET")),
 		Mailbox:        strings.TrimSpace(os.Getenv("MAILBOX")),
+		InboxFolder:    strings.TrimSpace(os.Getenv("INBOX_FOLDER")),
 		SimulationMode: parseBool(os.Getenv("SIMULATION_MODE"), true),
 		GeminiAPIKey:   strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
 		GeminiModel:    orDefault(os.Getenv("GEMINI_MODEL"), "gemini-2.0-flash"),

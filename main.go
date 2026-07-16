@@ -11,9 +11,11 @@
 // Módulo 3: busca cada factura en SQL Server por su CUFE; si existe, actualiza
 // los campos de recepción e inserta el PDF y el XML en la tabla Adjuntos.
 //
-// En cada corrida procesa (Mejora 2): (1) los correos no leídos de la bandeja de
-// entrada y (2) los correos de la carpeta /Pendientes. Lógica de carpetas
-// (Ajuste 2):
+// En cada corrida procesa (Mejora 2): (1) los correos no leídos de la carpeta de
+// entrada y (2) los correos de su carpeta /Pendientes. La carpeta de entrada es
+// la Bandeja de entrada salvo que INBOX_FOLDER indique otra, en cuyo caso esa
+// pasa a ser la raíz del flujo y /Procesados y /Pendientes cuelgan de ella (útil
+// para probar sin tocar el árbol real de Inbox). Lógica de carpetas (Ajuste 2):
 //   - /Procesados: hay factura con CUFE + BD OK.
 //   - /Pendientes: hay factura con CUFE pero el CUFE no se encontró en la BD.
 //   - Sin factura válida (adjunto no ZIP/PDF, ZIP sin PDF/XML aprovechable, o
@@ -54,8 +56,9 @@ const (
 	tipoErrorSP  = "Llamada al SP"
 )
 
-// workItem es un correo a procesar junto con la carpeta de la que proviene
-// ("Inbox" o "Pendientes"), que determina a dónde se mueve tras procesarlo.
+// workItem es un correo a procesar junto con la carpeta de la que proviene (la
+// carpeta de entrada o "Pendientes"), que determina a dónde se mueve tras
+// procesarlo.
 type workItem struct {
 	msg    graph.Message
 	source string
@@ -137,6 +140,30 @@ func main() {
 	// 3) Cliente de Graph con el http.Client autenticado.
 	gc := graph.New(auth.HTTPClient(ctx, authCfg))
 
+	// 3.1) Carpeta de entrada. Por defecto la Bandeja de entrada; con INBOX_FOLDER
+	// se lee de otra carpeta y esa pasa a ser la RAÍZ del flujo: /Procesados y
+	// /Pendientes cuelgan de ella, de modo que una corrida de pruebas no toca el
+	// árbol real de Inbox. Es solo lectura (no se crea), así que respeta
+	// SIMULATION_MODE.
+	entradaID, entradaNombre := graph.InboxWellKnown, "Inbox"
+	if cfg.InboxFolder != "" {
+		id, found, err := gc.FindInboxFolder(ctx, cfg.Mailbox, cfg.InboxFolder)
+		if err != nil {
+			lg.Errorf("no se pudo buscar la carpeta INBOX_FOLDER=%q (conexión M365): %v", cfg.InboxFolder, err)
+			os.Exit(1)
+		}
+		if !found {
+			// Detenerse a propósito: caer en la Bandeja de entrada real sería
+			// procesar correos de producción creyendo que se prueba en otra carpeta.
+			lg.Errorf("la carpeta INBOX_FOLDER=%q no existe en el buzón %s; el agente se detiene para no procesar la Bandeja de entrada real por error.", cfg.InboxFolder, cfg.Mailbox)
+			os.Exit(1)
+		}
+		entradaID, entradaNombre = id, cfg.InboxFolder
+		lg.Infof("Carpeta de entrada: /%s (INBOX_FOLDER); /Procesados y /Pendientes colgarán de ella.", entradaNombre)
+	} else {
+		lg.Infof("Carpeta de entrada: Bandeja de entrada (Inbox).")
+	}
+
 	// Notificador de errores a soporte (Mejora 1). Remitente = buzón; destinatario
 	// = SMTP_TO. Deduplica por tipo y respeta SIMULATION_MODE.
 	notifier := notify.New(gc, cfg.Mailbox, cfg.SMTPTo, lg, cfg.SimulationMode)
@@ -146,9 +173,9 @@ func main() {
 		lg.Infof("Notificaciones de error → %s", cfg.SMTPTo)
 	}
 
-	// 4) Listar correos no leídos de la bandeja de entrada. Un fallo aquí es de
+	// 4) Listar correos no leídos de la carpeta de entrada. Un fallo aquí es de
 	// conexión a M365 → solo log local.
-	unread, err := gc.ListUnreadMessages(ctx, cfg.Mailbox)
+	unread, err := gc.ListUnreadMessages(ctx, cfg.Mailbox, entradaID)
 	if err != nil {
 		lg.Errorf("no se pudieron listar los correos no leídos (conexión M365): %v", err)
 		os.Exit(1)
@@ -176,21 +203,21 @@ func main() {
 	// ===================== Módulo 2 =====================
 	lg.Infof("=== Módulo 2 · extracción de datos de adjuntos ===")
 
-	// Construimos la lista de trabajo: (1) no leídos de Inbox con adjuntos y
-	// (2) correos de /Pendientes con adjuntos (Mejora 2). Filtramos hasAttachments
-	// del lado del cliente (Graph rechaza algunos filtros combinados).
+	// Construimos la lista de trabajo: (1) no leídos de la carpeta de entrada con
+	// adjuntos y (2) correos de su /Pendientes con adjuntos (Mejora 2). Filtramos
+	// hasAttachments del lado del cliente (Graph rechaza algunos filtros combinados).
 	var work []workItem
 	for _, m := range unread {
 		if m.HasAttachments {
-			work = append(work, workItem{msg: m, source: "Inbox"})
+			work = append(work, workItem{msg: m, source: entradaNombre})
 		}
 	}
 	inboxConAdj := len(work)
-	lg.Infof("Correos no leídos con adjuntos (Inbox): %d", inboxConAdj)
+	lg.Infof("Correos no leídos con adjuntos (/%s): %d", entradaNombre, inboxConAdj)
 
 	// Releer /Pendientes (solo lectura: no la creamos si no existe). En simulación
 	// tampoco se crea; si no existe simplemente no hay backlog que reprocesar.
-	if pendID, found, err := gc.FindInboxChildFolder(ctx, cfg.Mailbox, "Pendientes"); err != nil {
+	if pendID, found, err := gc.FindChildFolder(ctx, cfg.Mailbox, entradaID, "Pendientes"); err != nil {
 		lg.Errorf("no se pudo consultar la carpeta /Pendientes (conexión M365): %v", err)
 	} else if found {
 		pend, err := gc.ListChildFolderMessages(ctx, cfg.Mailbox, pendID)
@@ -232,7 +259,7 @@ func main() {
 	}
 
 	if len(work) == 0 {
-		lg.Infof("No hay correos que procesar (bandeja de entrada ni /Pendientes).")
+		lg.Infof("No hay correos que procesar (/%s ni /Pendientes).", entradaNombre)
 		logResumen(lg, inicio, time.Now(), resumen{})
 		return
 	}
@@ -286,7 +313,7 @@ func main() {
 	if !cfg.SimulationMode {
 		carpetas = make(map[string]string, 2)
 		for _, name := range []string{"Procesados", "Pendientes"} {
-			id, err := gc.ResolveInboxChildFolder(ctx, cfg.Mailbox, name)
+			id, err := gc.ResolveChildFolder(ctx, cfg.Mailbox, entradaID, name)
 			if err != nil {
 				lg.Errorf("no se pudo resolver/crear la carpeta /%s: %v", name, err)
 				continue
