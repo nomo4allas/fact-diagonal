@@ -7,6 +7,7 @@ import (
 
 	"github.com/nomo4allas/fact-diagonal/internal/attachment"
 	"github.com/nomo4allas/fact-diagonal/internal/database"
+	"github.com/nomo4allas/fact-diagonal/internal/extract/gemini"
 	"github.com/nomo4allas/fact-diagonal/internal/graph"
 	"github.com/nomo4allas/fact-diagonal/internal/invoice"
 )
@@ -142,5 +143,68 @@ func TestProcessBundle_ExtraccionOK_BDOK_Procesados(t *testing.T) {
 	}
 	if outcome != Procesados {
 		t.Fatalf("outcome = %v; se esperaba Procesados", outcome)
+	}
+}
+
+// 5. Mejora 2 — XML completo (FilledCount>=6 con CUFE) y además hay PDF: la
+// cascada del PDF se salta por completo (ni siquiera se consulta a Gemini). El
+// consolidado sale íntegro del XML y PDFData queda vacío. Usamos gemini==nil a
+// propósito: si la cascada se ejecutara, al llegar al eslabón de Gemini haría
+// panic por deref de nil; que la prueba no entre en pánico demuestra que la
+// cascada se saltó.
+func TestProcessBundle_XMLCompleto_SaltaCascadaPDF(t *testing.T) {
+	p := &Processor{log: noopLogger{}} // gemini nil, db nil a propósito
+
+	b := attachment.Bundle{
+		Origin:  "factura.zip",
+		XML:     []byte(ublConCUFE),
+		XMLName: "factura.xml",
+		PDF:     []byte("%PDF-1.4 contenido no procesable"),
+		PDFName: "factura.pdf",
+	}
+
+	res, outcome, err := p.processBundle(context.Background(), b, time.Now())
+	if err != nil {
+		t.Fatalf("no se esperaba error técnico: %v", err)
+	}
+	if outcome != Procesados {
+		t.Fatalf("outcome = %v; se esperaba Procesados", outcome)
+	}
+	if res.PDFData.FilledCount() != 0 {
+		t.Errorf("la cascada del PDF no debió ejecutarse; PDFData debería estar vacío, FilledCount=%d", res.PDFData.FilledCount())
+	}
+	if res.Final.FilledCount() < 6 || res.Final.CUFE == "" {
+		t.Errorf("el consolidado debería venir completo del XML; FilledCount=%d, CUFE=%q", res.Final.FilledCount(), res.Final.CUFE)
+	}
+}
+
+// 6. Mejora 2 (contraparte) — XML incompleto (sin CUFE) con PDF: la cascada del
+// PDF SÍ debe ejecutarse. Con un gemini no disponible (sin API key) la cascada
+// corre sus eslabones sin panic y sin extraer nada del PDF ilegible; el bundle
+// queda sin CUFE → SinFactura.
+func TestProcessBundle_XMLIncompleto_EjecutaCascadaPDF(t *testing.T) {
+	p := &Processor{
+		gemini: gemini.New("", "", ""), // no disponible: la cascada omite Gemini sin panic
+		log:    noopLogger{},
+	}
+
+	// XML sin CUFE ni campos aprovechables → fuerza la cascada del PDF.
+	b := attachment.Bundle{
+		Origin:  "factura.zip",
+		XML:     []byte("esto no es XML válido"),
+		XMLName: "factura.xml",
+		PDF:     []byte("%PDF-1.4 contenido no procesable"),
+		PDFName: "factura.pdf",
+	}
+
+	res, outcome, err := p.processBundle(context.Background(), b, time.Now())
+	if err != nil {
+		t.Fatalf("no se esperaba error técnico: %v", err)
+	}
+	if outcome != SinFactura {
+		t.Fatalf("outcome = %v; se esperaba SinFactura (sin CUFE)", outcome)
+	}
+	if res.Final.CUFE != "" {
+		t.Errorf("no debería haber CUFE; se obtuvo %q", res.Final.CUFE)
 	}
 }

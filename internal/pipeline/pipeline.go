@@ -232,7 +232,18 @@ func (p *Processor) processBundle(ctx context.Context, b attachment.Bundle, fech
 	}
 
 	// 2) PDF: cascada de extracción (respaldo/validación).
-	if b.HasPDF() {
+	//
+	// Mejora 2 — Si el XML ya trajo todos los campos clave incluyendo el CUFE
+	// (FilledCount >= 6 y CUFE no vacío), el PDF no aporta nada: saltamos la
+	// cascada completa (texto nativo → OCR → Gemini) para ese bundle. El PDF
+	// igual se adjunta a la BD más abajo, pero no se procesa con Gemini. Si no
+	// hay XML o está incompleto/sin CUFE, se procesa el PDF con la cascada normal;
+	// los PDFs directos sin XML (XMLData vacío) siempre entran a la cascada.
+	xmlCompleto := res.XMLData.FilledCount() >= 6 && strings.TrimSpace(res.XMLData.CUFE) != ""
+	switch {
+	case xmlCompleto && b.HasPDF():
+		p.log.Infof("    · XML completo (%d/6, con CUFE) → se salta la cascada del PDF %s; el PDF se adjuntará a la BD sin procesar con Gemini", res.XMLData.FilledCount(), b.PDFName)
+	case b.HasPDF():
 		d, notes := p.cascadePDF(ctx, b.PDF)
 		res.PDFData = d
 		for _, n := range notes {

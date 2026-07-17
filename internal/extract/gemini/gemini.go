@@ -34,6 +34,12 @@ const (
 	// backoff exponencial antes de rendirnos.
 	maxAttempts = 4
 	baseBackoff = 1500 * time.Millisecond
+
+	// callTimeout acota cada llamada completa a Gemini (incluidos los reintentos).
+	// Mejora 1: cada PDF usa su propio contexto con este límite, independiente del
+	// contexto global de la corrida, para que un cuelgue o fallo de Gemini quede
+	// contenido y no afecte las llamadas posteriores a SQL Server ni a MS365.
+	callTimeout = 90 * time.Second
 )
 
 // prompt pide a Gemini un JSON estricto con los campos de interés.
@@ -136,10 +142,20 @@ type fields struct {
 }
 
 // Extract envía el PDF a Gemini y devuelve los campos extraídos.
-func (c *Client) Extract(ctx context.Context, pdf []byte) (invoice.Data, error) {
+//
+// Mejora 1: la llamada usa su propio context.WithTimeout (callTimeout), derivado
+// de context.Background() y NO del ctx global de la corrida. Así, si Gemini se
+// cuelga o falla, el error queda contenido en esta llamada y no propaga la
+// cancelación al resto del pipeline (SQL Server, MS365). El ctx recibido se
+// conserva en la firma por compatibilidad con la cascada, pero deliberadamente
+// no se encadena para lograr esa independencia.
+func (c *Client) Extract(_ context.Context, pdf []byte) (invoice.Data, error) {
 	if !c.Available() {
 		return invoice.Data{}, fmt.Errorf("Gemini no disponible: GEMINI_API_KEY vacía")
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
 
 	reqBody := genRequest{
 		Contents: []content{{
