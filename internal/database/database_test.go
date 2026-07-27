@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -330,6 +331,160 @@ func TestDatosBusquedaTiposString(t *testing.T) {
 	for nombre, v := range map[string]any{"@nit": nit, "@NumDoc": numDoc, "@Prefijo": prefijo} {
 		if _, ok := v.(string); !ok {
 			t.Errorf("%s = %T, se esperaba string (varchar(20) en el SP)", nombre, v)
+		}
+	}
+}
+
+// TestDatosFacturaJSON verifica el JSON que la Operacion 3 envía en @Cufe: las
+// diez claves acordadas con el SP, en orden, con los valores extraídos y sin
+// espacios sobrantes.
+func TestDatosFacturaJSON(t *testing.T) {
+	data := invoice.Data{
+		Numero:       " FES15380 ",
+		Prefijo:      "FES",
+		NIT:          "809.010.841-5",
+		RazonSocial:  "PROVEEDOR S.A.S.",
+		FechaEmision: "2026-07-14",
+		ValorTotal:   "1234567.89",
+		CUFE:         "  45c52f79f45e2d1abb8b68d1de874b7d  ",
+		Pedido:       "001234",
+		Declarac:     "DEC-99",
+		BL:           "BL-4567",
+	}
+
+	got, err := datosFacturaJSON(data)
+	if err != nil {
+		t.Fatalf("datosFacturaJSON devolvió error: %v", err)
+	}
+
+	want := `{"numero":"FES15380","prefijo":"FES","nit":"809.010.841-5","razon_social":"PROVEEDOR S.A.S.",` +
+		`"fecha_emision":"2026-07-14","valor_total":"1234567.89","cufe":"45c52f79f45e2d1abb8b68d1de874b7d",` +
+		`"pedido":"001234","declarac":"DEC-99","bl":"BL-4567"}`
+	if got != want {
+		t.Errorf("datosFacturaJSON =\n%s\nwant\n%s", got, want)
+	}
+
+	// El JSON debe ser válido y llevar siempre las diez claves (los campos que
+	// no se pudieron extraer viajan como cadena vacía, no ausentes).
+	vacio, err := datosFacturaJSON(invoice.Data{})
+	if err != nil {
+		t.Fatalf("datosFacturaJSON(vacío) devolvió error: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(vacio), &m); err != nil {
+		t.Fatalf("el JSON de la Operacion 3 no es válido: %v (%s)", err, vacio)
+	}
+	claves := []string{"numero", "prefijo", "nit", "razon_social", "fecha_emision",
+		"valor_total", "cufe", "pedido", "declarac", "bl"}
+	if len(m) != len(claves) {
+		t.Errorf("el JSON tiene %d claves, se esperaban %d: %s", len(m), len(claves), vacio)
+	}
+	for _, k := range claves {
+		v, ok := m[k]
+		if !ok {
+			t.Errorf("falta la clave %q en el JSON: %s", k, vacio)
+			continue
+		}
+		if v != "" {
+			t.Errorf("clave %q = %#v, se esperaba cadena vacía", k, v)
+		}
+	}
+}
+
+// TestOp3SoloRadicadoYCufe fija el reparto de parámetros de la Operacion 3: solo
+// viajan @Operacion, @Radicado y @Cufe (el JSON); los demás van NULL.
+func TestOp3SoloRadicadoYCufe(t *testing.T) {
+	// spParams poblado como si viniera de otra operación: nada de eso debe
+	// llegar al SP en la Operacion 3.
+	p := spParams{
+		Operacion:         opDatosFactura,
+		Cufe:              `{"numero":"FES15380"}`,
+		Radicado:          4321,
+		FechaHoraOriginal: time.Now(),
+		Mandato:           "001234",
+		NIT:               "809010841",
+		NumDoc:            "FES15380",
+		Prefijo:           "FES",
+	}
+
+	nit, numDoc, prefijo := p.argsBusqueda()
+	fechaHora, mandato := p.argsActualizacion()
+	nulos := map[string]any{
+		"@nit": nit, "@NumDoc": numDoc, "@Prefijo": prefijo,
+		"@FechaHoraOriginal": fechaHora, "@Mandato": mandato,
+	}
+	for nombre, v := range nulos {
+		if v != nil {
+			t.Errorf("Operacion 3: %s = %v, se esperaba NULL", nombre, v)
+		}
+	}
+
+	// @Radicado y @Cufe (el JSON) sí viajan: son los dos únicos datos de la
+	// Operacion 3 además de @Operacion.
+	if p.Radicado != 4321 {
+		t.Errorf("Operacion 3: @Radicado = %d, want 4321", p.Radicado)
+	}
+	if p.Cufe == "" {
+		t.Error("Operacion 3: @Cufe llegó vacío, debe llevar el JSON de la factura")
+	}
+}
+
+// TestArgsActualizacion fija que @FechaHoraOriginal y @Mandato solo viajan en
+// las Operaciones 0 y 1, y NULL en la 2 y la 3.
+func TestArgsActualizacion(t *testing.T) {
+	base := spParams{FechaHoraOriginal: time.Now(), Mandato: "001234"}
+
+	casos := []struct {
+		operacion int
+		quiereSet bool
+	}{
+		{opBuscarCUFE, true},
+		{opActualizar, true},
+		{opInsertarAdjunto, false},
+		{opDatosFactura, false},
+	}
+	for _, k := range casos {
+		p := base
+		p.Operacion = k.operacion
+		fechaHora, mandato := p.argsActualizacion()
+
+		for nombre, v := range map[string]any{"@FechaHoraOriginal": fechaHora, "@Mandato": mandato} {
+			if k.quiereSet && v == nil {
+				t.Errorf("Operacion %d: %s = NULL, se esperaba un valor", k.operacion, nombre)
+			}
+			if !k.quiereSet && v != nil {
+				t.Errorf("Operacion %d: %s = %v, se esperaba NULL", k.operacion, nombre, v)
+			}
+		}
+	}
+}
+
+// TestOp3Simulacion comprueba que en SIMULATION_MODE la Operacion 3 registra el
+// JSON que enviaría, sin llamar al SP (db nil no debe usarse), y que el flujo
+// sigue con las demás operaciones.
+func TestOp3Simulacion(t *testing.T) {
+	log := &capturaLog{}
+	c := &Client{log: log, simulation: true, spName: "sp_ManRadicadoFacturas"}
+
+	data := facturaFES15380
+	data.RazonSocial = "PROVEEDOR S.A.S."
+	data.FechaEmision = "2026-07-14"
+	data.ValorTotal = "1234567.89"
+	data.Pedido = "001234"
+	data.Declarac = "DEC-99"
+	data.BL = "BL-4567"
+
+	if _, err := c.PersistInvoice(context.Background(), data, time.Now(), nil); err != nil {
+		t.Fatalf("PersistInvoice devolvió error: %v", err)
+	}
+
+	esperado, err := datosFacturaJSON(data)
+	if err != nil {
+		t.Fatalf("datosFacturaJSON devolvió error: %v", err)
+	}
+	for _, want := range []string{"@Operacion=3", "@Radicado=<Op0>", "@Cufe=" + esperado} {
+		if !strings.Contains(log.joined(), want) {
+			t.Errorf("el log de simulación de la Operacion 3 no contiene %q; log:\n%s", want, log.joined())
 		}
 	}
 }

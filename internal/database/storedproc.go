@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ const (
 	opBuscarCUFE      = 0 // buscar el radicado por CUFE
 	opActualizar      = 1 // actualizar Man_RadicadoFacturas
 	opInsertarAdjunto = 2 // insertar un adjunto
+	opDatosFactura    = 3 // registrar los datos extraídos de la factura (JSON en @Cufe)
 )
 
 // Límites de longitud de los parámetros varchar del SP (se truncan si exceden).
@@ -77,7 +79,9 @@ func aHoraColombia(t time.Time) time.Time {
 // spParams agrupa los parámetros de entrada del SP. Cada operación llena solo los
 // que necesita; el resto viaja con su valor cero / NULL.
 type spParams struct {
-	Operacion         int
+	Operacion int
+	// Cufe es el CUFE de la factura en las Operaciones 0, 1 y 2; en la
+	// Operacion 3 @Cufe transporta el JSON con los datos extraídos.
 	Cufe              string
 	Radicado          int
 	FechaHoraOriginal time.Time
@@ -97,19 +101,22 @@ type spParams struct {
 }
 
 // PersistInvoice ejecuta el flujo del Módulo 3 para una factura, orquestando las
-// tres operaciones del SP, y devuelve el desenlace (Persistencia) para que el
+// operaciones del SP, y devuelve el desenlace (Persistencia) para que el
 // pipeline decida la carpeta destino.
 //
 // Flujo:
 //  1. Operacion 0 (buscar por CUFE). @Resultado=0 → EstadoNoHallado (Pendientes).
 //     @Resultado>0 → es el radicado; se continúa.
 //  2. Operacion 1 (actualizar). Si devuelve 0 se registra advertencia pero se
-//     sigue con los adjuntos.
-//  3. Operacion 2 (insertar adjunto) por cada archivo del ZIP (PDF, XML, JPG,
+//     sigue con el resto del flujo.
+//  3. Operacion 3 (datos extraídos de la factura, en JSON). Es informativa: si
+//     falla o devuelve 0 solo se registra advertencia y se sigue con los
+//     adjuntos; nunca por sí sola manda el correo a Pendientes.
+//  4. Operacion 2 (insertar adjunto) por cada archivo del ZIP (PDF, XML, JPG,
 //     TIF, DOCX…), todos con @NotasAdjunto = número de documento. Si alguno
 //     devuelve 0 → EstadoPendiente. Todos OK → EstadoProcesado.
 //
-// Las Operaciones 1 y 2 solo se ejecutan si la Operacion 0 halló el CUFE
+// Las Operaciones 1, 3 y 2 solo se ejecutan si la Operacion 0 halló el CUFE
 // (Radicado > 0); en caso contrario → EstadoNoHallado (Pendientes).
 //
 // Un error técnico al invocar el SP se propaga (el pipeline lo clasifica como
@@ -168,7 +175,12 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 		c.log.Infof("    · BD: Operacion 1 (actualizar Radicado=%d) OK → Resultado=%d", radicado, res1)
 	}
 
-	// 3) Operacion 2 — insertar todos los adjuntos del ZIP (PDF, XML y demás).
+	// 3) Operacion 3 — registrar los datos extraídos de la factura (JSON en
+	// @Cufe). Es informativa y no bloquea: cualquier fallo se queda en una
+	// advertencia y el flujo continúa con los adjuntos.
+	c.enviarDatosFactura(ctx, data, radicado)
+
+	// 4) Operacion 2 — insertar todos los adjuntos del ZIP (PDF, XML y demás).
 	// @NotasAdjunto lleva el número de documento de la factura para todos.
 	notas := notasParaAdjunto(data.Numero)
 	insertados, todosOK := 0, true
@@ -216,32 +228,107 @@ func (c *Client) PersistInvoice(ctx context.Context, data invoice.Data, fechaCor
 	return Persistencia{Estado: estado, Radicado: radicado, Adjuntos: insertados}, nil
 }
 
+// enviarDatosFactura ejecuta la Operacion 3: envía al SP, en @Cufe y como JSON,
+// los datos que el Módulo 2 extrajo de la factura, asociados al radicado que
+// devolvió la Operacion 0.
+//
+// Es una operación informativa y deliberadamente no bloqueante: no devuelve
+// error ni altera la Persistencia. Si el JSON no se puede armar, si el SP falla
+// o si devuelve @Resultado=0, solo se registra una advertencia y el flujo sigue
+// con los adjuntos (el correo no va a Pendientes por esto).
+func (c *Client) enviarDatosFactura(ctx context.Context, data invoice.Data, radicado int) {
+	datos, err := datosFacturaJSON(data)
+	if err != nil {
+		c.log.Infof("    · BD: ⚠ Operacion 3 (datos de la factura, Radicado=%d) omitida: no se pudo armar el JSON: %v; se continúa con los adjuntos", radicado, err)
+		return
+	}
+
+	res, msg, err := c.callSP(ctx, spParams{
+		Operacion: opDatosFactura,
+		Cufe:      datos,
+		Radicado:  radicado,
+	})
+	if err != nil {
+		c.log.Errorf("    · BD: ⚠ Operacion 3 (datos de la factura, Radicado=%d) falló: %v; se continúa con los adjuntos", radicado, err)
+		return
+	}
+	if res <= 0 {
+		c.log.Infof("    · BD: ⚠ Operacion 3 (datos de la factura, Radicado=%d) devolvió 0 (Mensaje=%q); se continúa con los adjuntos", radicado, msg)
+		return
+	}
+	c.log.Infof("    · BD: Operacion 3 (datos de la factura, Radicado=%d) OK → Resultado=%d", radicado, res)
+}
+
+// datosFactura es la estructura del JSON que la Operacion 3 envía en @Cufe. El
+// orden de los campos es el del JSON acordado con el SP (encoding/json respeta
+// el orden de declaración) y las claves son las que el SP lee.
+type datosFactura struct {
+	Numero       string `json:"numero"`
+	Prefijo      string `json:"prefijo"`
+	NIT          string `json:"nit"`
+	RazonSocial  string `json:"razon_social"`
+	FechaEmision string `json:"fecha_emision"`
+	ValorTotal   string `json:"valor_total"`
+	CUFE         string `json:"cufe"`
+	Pedido       string `json:"pedido"`
+	Declarac     string `json:"declarac"`
+	BL           string `json:"bl"`
+}
+
+// datosFacturaJSON serializa los datos extraídos de la factura para la
+// Operacion 3. Los campos que no se pudieron extraer viajan como cadena vacía
+// (la clave siempre está presente) y se recortan los espacios sobrantes; no se
+// aplican los límites varchar del SP porque aquí el valor viaja dentro del JSON,
+// no en un parámetro por campo.
+func datosFacturaJSON(data invoice.Data) (string, error) {
+	b, err := json.Marshal(datosFactura{
+		Numero:       strings.TrimSpace(data.Numero),
+		Prefijo:      strings.TrimSpace(data.Prefijo),
+		NIT:          strings.TrimSpace(data.NIT),
+		RazonSocial:  strings.TrimSpace(data.RazonSocial),
+		FechaEmision: strings.TrimSpace(data.FechaEmision),
+		ValorTotal:   strings.TrimSpace(data.ValorTotal),
+		CUFE:         strings.TrimSpace(data.CUFE),
+		Pedido:       strings.TrimSpace(data.Pedido),
+		Declarac:     strings.TrimSpace(data.Declarac),
+		BL:           strings.TrimSpace(data.BL),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 // callSP invoca el Stored Procedure por RPC con los parámetros que aplican a la
 // operación (los que no aplican viajan como NULL) y lee los de salida @Mensaje y
 // @Resultado.
 //
 // Reparto de parámetros por operación:
-//   - @Cufe: aplica a las tres operaciones. En la inserción de adjunto (2) el SP
-//     lo usa para validar que el registro exista antes de insertar.
+//   - @Cufe: aplica a todas las operaciones. En la inserción de adjunto (2) el SP
+//     lo usa para validar que el registro exista antes de insertar; en los datos
+//     de la factura (3) no lleva el CUFE sino el JSON con los datos extraídos.
+//   - @Radicado: el radicado hallado por la búsqueda (0); lo usan la
+//     actualización (1), la inserción de adjunto (2) y los datos de la factura (3).
 //   - @FechaHoraOriginal y @Mandato: aplican a la búsqueda (0) y la
-//     actualización (1); NULL en la inserción de adjunto (2).
+//     actualización (1); NULL en las demás operaciones.
 //   - @nit, @NumDoc y @Prefijo: solo aplican a la búsqueda (0), donde el SP los
 //     usa como respaldo si el CUFE no aparece; NULL en las demás operaciones.
 //   - @NotasAdjunto, @NombreAdjunto, @Extension y @Adjunto: solo aplican a la
 //     inserción de adjunto (2); NULL en las demás operaciones.
 //
+// Es decir, la Operacion 3 viaja solo con @Operacion, @Radicado y @Cufe (el
+// JSON); todo lo demás va NULL.
+//
 // Los sql.Named se listan en el mismo orden que la firma del SP por legibilidad;
 // el enlace es por nombre, así que el orden no altera la llamada.
 func (c *Client) callSP(ctx context.Context, p spParams) (resultado int, mensaje string, err error) {
-	// @Cufe viaja en las tres operaciones (el SP lo valida también en la Op 2).
+	// @Cufe viaja en todas las operaciones: el CUFE en las Operaciones 0, 1 y 2
+	// (el SP lo valida también al insertar el adjunto) y el JSON con los datos
+	// extraídos en la Operacion 3.
 	cufe := any(p.Cufe)
 
-	// @FechaHoraOriginal y @Mandato: NULL en la Operacion 2 (insertar adjunto).
-	var fechaHora, mandato any // nil → NULL
-	if p.Operacion != opInsertarAdjunto {
-		fechaHora = p.FechaHoraOriginal
-		mandato = p.Mandato
-	}
+	// @FechaHoraOriginal y @Mandato: solo en la búsqueda (0) y la actualización (1).
+	fechaHora, mandato := p.argsActualizacion()
 
 	// Datos de respaldo: solo en la Operacion 0 (buscar).
 	nit, numDoc, prefijo := p.argsBusqueda()
@@ -291,6 +378,14 @@ func (c *Client) simular(data invoice.Data, cufe string, fechaCol time.Time, man
 		c.spName, cufe, orNULL(nit), orNULL(numDoc), orNULL(prefijo))
 	c.log.Infof("    · BD [SIMULACIÓN] Operacion 1 (actualizar) → SP %s(@Operacion=1, @Radicado=<Op0>, @Cufe=%s, @FechaHoraOriginal='%s' (UTC-5), @Mandato=%s)",
 		c.spName, cufe, fechaCol.Format("2006-01-02 15:04:05"), orNULL(mandato))
+
+	// Operacion 3: se registra el JSON que se enviaría en @Cufe, sin llamar al SP.
+	if datos, err := datosFacturaJSON(data); err != nil {
+		c.log.Infof("    · BD [SIMULACIÓN] Operacion 3 (datos de la factura) omitida: no se pudo armar el JSON: %v", err)
+	} else {
+		c.log.Infof("    · BD [SIMULACIÓN] Operacion 3 (datos de la factura) → SP %s(@Operacion=3, @Radicado=<Op0>, @Cufe=%s)",
+			c.spName, datos)
+	}
 
 	notas := notasParaAdjunto(data.Numero)
 	insertables := 0
@@ -345,6 +440,17 @@ func (p spParams) argsBusqueda() (nit, numDoc, prefijo any) { // nil → NULL
 		prefijo = p.Prefijo
 	}
 	return nit, numDoc, prefijo
+}
+
+// argsActualizacion reparte @FechaHoraOriginal y @Mandato: llevan valor solo en
+// la búsqueda (0) y la actualización (1), que son las operaciones donde el SP
+// los usa, y viajan NULL en la inserción de adjunto (2) y en los datos de la
+// factura (3) aunque spParams los traiga poblados.
+func (p spParams) argsActualizacion() (fechaHora, mandato any) { // nil → NULL
+	if p.Operacion != opBuscarCUFE && p.Operacion != opActualizar {
+		return nil, nil
+	}
+	return p.FechaHoraOriginal, p.Mandato
 }
 
 // datosBusqueda arma los tres datos de respaldo que la Operacion 0 envía junto

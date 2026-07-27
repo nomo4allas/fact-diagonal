@@ -1,10 +1,11 @@
 // Package database implementa el Módulo 3: integración con SQL Server.
 //
-// Toda la lógica de negocio (buscar por CUFE, actualizar el radicado e insertar
-// los adjuntos) la resuelve el Stored Procedure del cliente
-// Spd_IA_DocumentosElectronicos. Este paquete solo lo invoca con las tres
-// operaciones definidas (0=buscar, 1=actualizar, 2=insertar adjunto) y traduce
-// su @Resultado al desenlace que el pipeline usa para clasificar el correo.
+// Toda la lógica de negocio (buscar por CUFE, actualizar el radicado, registrar
+// los datos extraídos e insertar los adjuntos) la resuelve el Stored Procedure
+// del cliente Spd_IA_DocumentosElectronicos. Este paquete solo lo invoca con las
+// operaciones definidas (0=buscar, 1=actualizar, 2=insertar adjunto, 3=datos de
+// la factura en JSON) y traduce su @Resultado al desenlace que el pipeline usa
+// para clasificar el correo.
 //
 // Reglas de seguridad:
 //   - Nuestro código NO ejecuta INSERT/UPDATE directos: todo pasa por el SP.
